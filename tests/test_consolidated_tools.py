@@ -235,6 +235,23 @@ def test_export_scene_on_an_old_addon_asks_for_an_update(monkeypatch):
     assert "too old for the roblox export preset" in reply and "install-addon" in reply
     reply = asyncio.run(server.export_scene(None, filepath="//a.fbx"))
     assert "too old" in reply and len(blender.sent) == 1, "// needs the new addon; not sent"
+    reply = asyncio.run(server.export_scene(None, filepath="~/exports/a.fbx"))
+    assert "too old for paths starting with // or ~" in reply and len(blender.sent) == 1, \
+        "an old addon would write into a folder named ~; not sent"
+
+
+def test_export_scene_leaves_home_paths_to_blender(monkeypatch):
+    from blender_mcp.addon_manager import EXPECTED_ADDON_PROTOCOL_VERSION, AddonHandshake
+
+    blender = _Blender({"export_scene": {"path": "/home/artist/exports/a.glb", "bytes": 10, "selection_only": False,
+                                         "exported": ["A"], "warnings": ["Left out because ...: Ref."]}})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: blender)
+    current = AddonHandshake(True, EXPECTED_ADDON_PROTOCOL_VERSION, [2, 1], [], "4.2", "native")
+    monkeypatch.setattr(server, "_addon_handshake", current)
+    reply = asyncio.run(server.export_scene(None, filepath="~/exports/a.glb"))
+    # ~ is the home folder of Blender's machine, which may not be this one.
+    assert blender.sent[0][1]["filepath"] == "~/exports/a.glb"
+    assert "1 export warning(s)" in reply and "- Left out because ...: Ref." in reply
 
 
 def test_export_scene_passes_addon_errors_through(monkeypatch):

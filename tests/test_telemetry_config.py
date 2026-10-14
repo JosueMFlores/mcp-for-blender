@@ -123,7 +123,15 @@ def test_addon_status_answers_without_config(no_config, blender):
     reply = asyncio.run(server.get_addon_status(None))
     assert not reply.startswith("Error"), reply
     payload, _ = json.JSONDecoder().raw_decode(reply)
+    # The box is ticked in Blender, but a source build has nowhere to send data.
     assert payload["telemetry_consent"] is True
+    assert payload["telemetry_enabled"] is False
+
+
+def test_addon_status_reports_telemetry_enabled_with_a_release_config(release_config, blender):
+    reply = asyncio.run(server.get_addon_status(None))
+    payload, _ = json.JSONDecoder().raw_decode(reply)
+    assert payload["telemetry_enabled"] is True and payload["telemetry_consent"] is False
 
 
 def test_disable_telemetry_works_without_config(no_config, blender):

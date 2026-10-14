@@ -1198,9 +1198,10 @@ ROBLOX_FBX_SETTINGS = {
 # Limits from create.roblox.com/docs/art/modeling/specifications.
 ROBLOX_MAX_TRIANGLES = 20000  # per mesh
 ROBLOX_MAX_INFLUENCES = 4  # bones per vertex
-# Roblox's standard texture map size. Avatar Marketplace items take up to 2048;
-# larger images are downscaled.
-ROBLOX_TEXTURE_SIZE = 1024
+# Textures go up to 4096x4096 (art/modeling/texture-specifications), but Marketplace
+# avatar items (bodies, rigid accessories) can't exceed 2048x2048 (avatar/*/specifications).
+ROBLOX_AVATAR_TEXTURE_SIZE = 2048
+ROBLOX_MAX_TEXTURE_SIZE = 4096
 R15_BONES = (
     "HumanoidRootNode", "LowerTorso", "UpperTorso", "Head",
     "LeftUpperArm", "LeftLowerArm", "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
@@ -1222,8 +1223,10 @@ def _export_path(filepath, fmt):
     if not os.path.isabs(filepath):
         return None, f"filepath must be absolute or start with // (the .blend's folder), got '{filepath}'"
     root, ext = os.path.splitext(filepath)
-    if ext.lower() != "." + fmt and ext.lower() in ("", ".glb", ".gltf", ".fbx"):
-        filepath = root + "." + fmt
+    if ext.lower() != "." + fmt:
+        # Only a model extension is swapped: in Chair.001 the dot is part of the name,
+        # and the glTF exporter would append .glb to it, leaving no file at filepath.
+        filepath = (root if ext.lower() in (".glb", ".gltf", ".fbx") else filepath) + "." + fmt
     return os.path.normpath(filepath), None
 
 
@@ -1318,9 +1321,13 @@ def _roblox_warnings(objects, depsgraph=None):
     no_file = []
     for image in images.values():
         width, height = image.size[0], image.size[1]
-        if max(width, height) > ROBLOX_TEXTURE_SIZE:
-            warnings.append(f"Image '{image.name}' is {width}x{height}. Roblox textures are {ROBLOX_TEXTURE_SIZE}x"
-                            f"{ROBLOX_TEXTURE_SIZE} (2048 for avatar Marketplace items); larger ones get downscaled.")
+        if max(width, height) > ROBLOX_AVATAR_TEXTURE_SIZE:
+            general = f"{ROBLOX_MAX_TEXTURE_SIZE}x{ROBLOX_MAX_TEXTURE_SIZE}"
+            general = (f"it's also over Roblox's general max of {general}"
+                       if max(width, height) > ROBLOX_MAX_TEXTURE_SIZE else f"Roblox's general max is {general}")
+            warnings.append(f"Image '{image.name}' is {width}x{height}. Avatar Marketplace items (bodies, rigid "
+                            f"accessories) can't exceed {ROBLOX_AVATAR_TEXTURE_SIZE}x{ROBLOX_AVATAR_TEXTURE_SIZE}; "
+                            f"{general}.")
         if not image.filepath:
             no_file.append(image.name)
 
@@ -2737,7 +2744,9 @@ class BlenderMCPServer:
 
         preset="roblox" forces FBX with Roblox Studio's import settings and adds
         "warnings": what in the exported objects Roblox would reject or import
-        wrong. The user's selection, active object and mode are put back afterwards.
+        wrong. Objects whose collection is excluded from the view layer are left
+        out with a warning, preset or not. The user's selection, active object and
+        mode are put back afterwards.
         """
         if not filepath:
             return {"error": "filepath is required"}
@@ -2774,9 +2783,23 @@ class BlenderMCPServer:
             use_selection = False
 
         view_layer = bpy.context.view_layer
+        # Objects in a collection excluded from the view layer can't be selected or made
+        # active, and the exporters skip them, so they're left out of the export and its checks.
+        in_layer = set(view_layer.objects)
+        excluded = [o.name for o in targets if o not in in_layer]
+        warnings = []
+        if excluded:
+            targets = [o for o in targets if o in in_layer]
+            named = [bpy.data.objects[n] for n in names if bpy.data.objects[n] in in_layer]
+            if names and not named:
+                return {"error": f"Nothing to export: {_name_list(excluded)} aren't in the active view layer. "
+                                 "Include their collection in it (its checkbox in the Outliner) and export again."}
+            names = [o.name for o in named]
+            warnings.append(f"Left out because their collection is excluded from the view layer: "
+                            f"{_name_list(excluded)}. Include it (its checkbox in the Outliner) to export them.")
+
         selected, active = list(bpy.context.selected_objects), view_layer.objects.active
         mode = getattr(active, "mode", 'OBJECT') if active is not None else 'OBJECT'
-        warnings = []
         try:
             # Exporters read object data, which edit and sculpt mode only write back on exit.
             if mode != 'OBJECT':
@@ -2833,6 +2856,7 @@ class BlenderMCPServer:
         }
         if preset:
             result["preset"] = preset
+        if preset or warnings:
             result["warnings"] = warnings
         return result
 

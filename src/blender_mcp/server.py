@@ -461,8 +461,10 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     If outdated, tells the user how to update with the returned `update_command`
     (then restart or re-enable the addon in Blender).
 
-    `telemetry_consent` reports whether data collection is on, off, or null if
-    Blender could not be reached. Use it to answer telemetry status questions.
+    Data is collected only when `telemetry_enabled` and `telemetry_consent` are both true.
+    `telemetry_enabled` is false in builds with no telemetry endpoint (source checkouts), where
+    nothing is ever sent. `telemetry_consent` is the user's choice in Blender: true, false, or
+    null if Blender could not be reached. Use them to answer telemetry status questions.
     """
     try:
         blender = get_blender_connection()
@@ -484,6 +486,7 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             **_integrations(blender, result.premium_generators),
             "source": result.source,
             "warning": result.warning,
+            "telemetry_enabled": is_telemetry_enabled(),
             "telemetry_consent": get_telemetry().check_user_consent(),
             "update_command": uvx_command("install-addon"),
             "after_install": (
@@ -2027,9 +2030,11 @@ async def export_scene(
         params["preset"] = preset
     try:
         blender = get_blender_connection()  # connecting runs the handshake read below
-        # Older addons don't resolve //: the file would go to the filesystem root, or fail.
-        if filepath.startswith("//") and _addon_handshake is not None and not _addon_handshake.up_to_date:
-            return missing_feature("paths relative to the .blend (//)")
+        # Older addons resolve neither // nor ~: the file would go to the filesystem root, or
+        # to a folder literally named ~ in Blender's working directory. ~ isn't expanded here
+        # because it means the home folder of Blender's machine, which may not be this one.
+        if filepath.startswith(("//", "~")) and _addon_handshake is not None and not _addon_handshake.up_to_date:
+            return missing_feature("paths starting with // or ~")
         result = blender.send_command("export_scene", params)
     except Exception as e:
         if _addon_lacks(e):

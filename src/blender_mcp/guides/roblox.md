@@ -57,9 +57,9 @@ twists. Export the 15 fitted cages only, never the template's own armature, atta
 
 - 20,000 triangles per mesh (`len(me.loops) - 2 * len(me.polygons)`). Avatar items have smaller
   per-part budgets: check current Roblox docs.
-- Textures: 1024x1024 is Roblox's standard size; avatar Marketplace items take up to 2048x2048 and
-  larger images get downscaled. Plug the Image Texture straight into Principled Base Color (a Mix
-  in between loses the texture in FBX), and keep each image saved as a PNG file.
+- Textures: up to 4096x4096 in general, but Marketplace avatar items (bodies, rigid accessories)
+  can't exceed 2048x2048. Plug the Image Texture straight into Principled Base Color (a Mix in
+  between loses the texture in FBX), and keep each image saved as a PNG file.
 - A packed image you repaint keeps its old packed bytes: after `image.save()`, `image.unpack(method="REMOVE")`,
   `image.reload()`, then `image.pack()`, or the FBX carries the old texture.
 

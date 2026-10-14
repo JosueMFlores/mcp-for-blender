@@ -30,7 +30,7 @@ def _armature_data(bones):
 
 class _Object:
     def __init__(self, name, children=(), type="MESH", data=None, matrix=None, mode="OBJECT", materials=(),
-                 modifiers=(), vertex_groups=(), action=None, selectable=True):
+                 modifiers=(), vertex_groups=(), action=None, selectable=True, in_view_layer=True):
         self.name = name
         self.children_recursive = list(children)
         self.selected = False
@@ -43,8 +43,11 @@ class _Object:
         self.vertex_groups = list(vertex_groups)
         self.animation_data = types.SimpleNamespace(action=action) if action else None
         self.selectable = selectable
+        self.in_view_layer = in_view_layer
 
     def select_set(self, value):
+        if not self.in_view_layer:
+            raise RuntimeError(f"Object '{self.name}' can't be selected because it is not in View Layer 'ViewLayer'!")
         # Like Blender, hidden objects silently stay unselected.
         if self.selectable or not value:
             self.selected = value
@@ -68,6 +71,26 @@ class _Objects:
         return iter(self._all)
 
 
+class _LayerObjects:
+    """view_layer.objects: the scene's objects minus those in excluded collections."""
+
+    def __init__(self, objects, active):
+        self._objects, self._active = objects, active
+
+    def __iter__(self):
+        return (o for o in self._objects if o.in_view_layer)
+
+    @property
+    def active(self):
+        return self._active
+
+    @active.setter
+    def active(self, obj):
+        if obj is not None and not obj.in_view_layer:
+            raise ValueError(f"ViewLayer 'ViewLayer' does not contain object '{obj.name}'")
+        self._active = obj
+
+
 def _load_addon(monkeypatch, objects, selected, exports, active=None, blend="", mode_calls=None):
     scene = types.SimpleNamespace(
         blendermcp_use_polyhaven=False,
@@ -82,7 +105,7 @@ def _load_addon(monkeypatch, objects, selected, exports, active=None, blend="", 
         scene=scene,
         object=None,
         selected_objects=selected,
-        view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=active)),
+        view_layer=types.SimpleNamespace(objects=_LayerObjects(objects, active)),
     )
     bpy.data = types.SimpleNamespace(objects=objects, filepath=blend)
     bpy.path = types.SimpleNamespace(abspath=lambda p: os.path.join(os.path.dirname(blend), p[2:]))
@@ -95,6 +118,8 @@ def _load_addon(monkeypatch, objects, selected, exports, active=None, blend="", 
 
     def export(kind):
         def _op(filepath, **kwargs):
+            if kind == "gltf" and os.path.splitext(filepath)[1].lower() not in (".glb", ".gltf"):
+                filepath += ".glb"  # as Blender's glTF exporter does
             selection = [o.name for o in objects if o.selected]
             exports.append({"kind": kind, "filepath": filepath, "selected": selection, **kwargs})
             with open(filepath, "wb") as fh:
@@ -103,7 +128,7 @@ def _load_addon(monkeypatch, objects, selected, exports, active=None, blend="", 
 
     def select_all(action):
         if action == "DESELECT":
-            for o in objects:
+            for o in bpy.context.view_layer.objects:
                 o.select_set(False)
 
     def mode_set(mode):
@@ -251,7 +276,7 @@ def _material(name, image=None, base_color_from=None):
 
 def test_roblox_preset_forces_fbx_with_studio_settings(monkeypatch, tmp_path):
     rig = _Object("Root", type="ARMATURE", data=_armature_data(R15))
-    body = _Object("Head_Geo", materials=[_material("Skin", _image("skin.png"), "TEX_IMAGE")])
+    body = _Object("Head_Geo", materials=[_material("Skin", _image("skin.png", size=(2048, 2048)), "TEX_IMAGE")])
     character = _Object("Character", type="EMPTY", data=None, children=[rig, body])
     camera = _Object("Camera", type="CAMERA")
     exports = []
@@ -262,7 +287,7 @@ def test_roblox_preset_forces_fbx_with_studio_settings(monkeypatch, tmp_path):
 
     assert result["path"] == str(tmp_path / "char.fbx"), "the preset's format decides the extension"
     assert result["preset"] == "roblox"
-    assert result["warnings"] == []
+    assert result["warnings"] == [], "2048x2048 is within even the avatar Marketplace limit"
     assert result["exported"] == ["Character", "Root", "Head_Geo"], "cameras and lights aren't exported"
     kwargs = exports[0]
     assert kwargs["kind"] == "fbx"
@@ -296,7 +321,7 @@ def test_roblox_warnings_name_what_studio_would_reject(monkeypatch, tmp_path):
                       modifiers=[types.SimpleNamespace(type="ARMATURE", object=heavy_rig)])
     dense = _Object("Statue", data=_mesh(triangles=20001))
     scaled = _Object("Crate", matrix=_Matrix(scale=(2.0, 2.0, 2.0)),
-                     materials=[_material("Wood", _image("wood.png", size=(2048, 2048)))])
+                     materials=[_material("Wood", _image("wood.png", size=(4096, 4096)))])
     flat = _Object("Sign", data=_mesh(uv=False),
                    materials=[_material("Paint", _image("Generated", filepath=""), "MIX")])
     attachment = _Object("Hat_Att", data=_mesh(triangles=0, uv=False), matrix=_Matrix(w=0.7))
@@ -316,7 +341,8 @@ def test_roblox_warnings_name_what_studio_would_reject(monkeypatch, tmp_path):
     assert "'Rig' is missing R15 bones" in text and "UpperTorso" in text
     assert "rotation or scale on Crate" in text
     assert "No UV map on Sign" in text and "Hat_Att" not in text
-    assert "'wood.png' is 2048x2048" in text
+    assert "'wood.png' is 4096x4096" in text and "can't exceed 2048x2048" in text
+    assert "general max is 4096x4096" in text
     assert "Base Color isn't an Image Texture plugged straight in on Paint" in text
     assert "no file on disk: Generated" in text
     assert "hidden or unselectable: Cage" in text and "Cage" not in result["exported"]
@@ -376,3 +402,77 @@ def test_selection_is_put_back_when_the_export_fails(monkeypatch, tmp_path):
         pass
     assert lamp.selected and not chair.selected
     assert addon.bpy.context.view_layer.objects.active is lamp
+
+
+def test_texture_over_the_general_max_says_so(monkeypatch, tmp_path):
+    poster = _Object("Poster", materials=[_material("Print", _image("poster.png", size=(8192, 4096)), "TEX_IMAGE")])
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(poster), [], exports)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "p.fbx"), preset="roblox")
+
+    assert result["warnings"] == ["Image 'poster.png' is 8192x4096. Avatar Marketplace items (bodies, rigid "
+                                  "accessories) can't exceed 2048x2048; it's also over Roblox's general max of "
+                                  "4096x4096."]
+
+
+def test_a_dot_in_the_name_is_not_taken_for_an_extension(monkeypatch, tmp_path):
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(_Object("A")), [], exports)
+    server = addon.BlenderMCPServer()
+
+    result = server.export_scene(str(tmp_path / "Chair.001"))
+    assert result["path"] == str(tmp_path / "Chair.001.glb")
+    assert exports[-1]["filepath"] == result["path"], "the glTF exporter had nothing to append"
+    assert server.export_scene(str(tmp_path / "sword_v1.5"), format="fbx")["path"] == str(tmp_path / "sword_v1.5.fbx")
+    assert server.export_scene(str(tmp_path / "a.gltf"))["path"] == str(tmp_path / "a.glb")
+    assert server.export_scene(str(tmp_path / "b.glb"), format="fbx")["path"] == str(tmp_path / "b.fbx")
+    assert server.export_scene(str(tmp_path / "c.GLB"))["path"] == str(tmp_path / "c.GLB")
+
+
+def test_objects_excluded_from_the_view_layer_are_left_out_and_named(monkeypatch, tmp_path):
+    leg = _Object("Leg", in_view_layer=False)
+    chair = _Object("Chair", children=[leg])
+    ref = _Object("Reference", in_view_layer=False)
+    lamp = _Object("Lamp")
+    lamp.selected = True
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(chair, leg, ref, lamp), [lamp], exports, active=lamp)
+    server = addon.BlenderMCPServer()
+
+    # The first named object is excluded, so another one becomes active instead.
+    result = server.export_scene(str(tmp_path / "chair.glb"), object_names=["Reference", "Chair"])
+
+    assert result["exported"] == ["Chair"]
+    assert exports[-1]["selected"] == ["Chair"]
+    assert result["warnings"] == ["Left out because their collection is excluded from the view layer: Reference, "
+                                  "Leg. Include it (its checkbox in the Outliner) to export them."]
+    assert lamp.selected and not chair.selected
+    assert addon.bpy.context.view_layer.objects.active is lamp
+
+    whole = server.export_scene(str(tmp_path / "scene.glb"))
+    assert whole["exported"] == ["Chair", "Lamp"] and "Leg, Reference" in whole["warnings"][0]
+
+
+def test_roblox_checks_skip_objects_excluded_from_the_view_layer(monkeypatch, tmp_path):
+    dense = _Object("Statue", data=_mesh(triangles=20001), in_view_layer=False)
+    crate = _Object("Crate")
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(dense, crate), [], exports)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "c.fbx"), preset="roblox")
+
+    assert result["exported"] == ["Crate"]
+    assert len(result["warnings"]) == 1 and "excluded from the view layer: Statue" in result["warnings"][0]
+
+
+def test_only_excluded_objects_named_is_an_error_not_a_crash(monkeypatch, tmp_path):
+    ref = _Object("Reference", in_view_layer=False)
+    lamp = _Object("Lamp", mode="EDIT")
+    exports, modes = [], []
+    addon = _load_addon(monkeypatch, _Objects(ref, lamp), [], exports, active=lamp, mode_calls=modes)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "ref.glb"), object_names=["Reference"])
+
+    assert "Nothing to export: Reference" in result["error"] and "view layer" in result["error"]
+    assert exports == [] and modes == [], "rejected before touching the mode or selection"
