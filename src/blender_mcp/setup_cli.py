@@ -4,6 +4,8 @@
 Detects installed clients, adds a `blender` server entry that runs uvx by its
 absolute path (GUI apps don't inherit the terminal's PATH, hence `spawn uvx
 ENOENT`), installs the addon, and enables it by running Blender headless.
+Entries run the server from this fork's repo unless BLENDER_MCP_SOURCE says
+otherwise (see distribution.py).
 
 Config files are merged, never replaced: other servers are kept and a .bak of
 the previous file is written beside it. Claude Code and Codex are configured
@@ -27,8 +29,8 @@ from .addon_manager import (
     find_existing_addon_installs,
     install_addon,
 )
+from .distribution import PACKAGE, describe_source, server_source, uvx_args
 
-PACKAGE = "mcp-for-blender"
 OLD_PACKAGE = "blender-mcp"
 SERVER_NAME = "blender"
 # What the Codex plugin sets, so a plain Codex entry gets the same viewport
@@ -38,11 +40,14 @@ CODEX_PLUGIN_NAME = "mcp-for-blender"
 
 _NEW_RE = re.compile(r"(?<![\w-])mcp-for-blender(?![\w-])")
 _OLD_RE = re.compile(r"(?<![\w-])blender-mcp(?![\w-])")
+# A `--from` that names the package without a URL or path, like
+# mcp-for-blender==2.1, still runs it from PyPI.
+_PYPI_FROM_RE = re.compile(r"mcp-for-blender(?![\w./\\-])")
 
 # status values
 NEW = "new"                # no entry yet: add one
-CONFIGURED = "configured"  # already runs mcp-for-blender: leave it alone
-OUTDATED = "outdated"      # runs the old blender-mcp package: offer to update
+CONFIGURED = "configured"  # already runs mcp-for-blender from server_source(): leave it alone
+OUTDATED = "outdated"      # runs the old blender-mcp, or mcp-for-blender from elsewhere: offer to update
 UNREADABLE = "unreadable"  # config exists but isn't valid JSON: don't touch
 
 
@@ -292,36 +297,77 @@ def _servers_key(style: str) -> str:
 
 def server_entry(style: str, uvx: str) -> dict:
     if style == "vscode":
-        return {"type": "stdio", "command": uvx, "args": [PACKAGE]}
+        return {"type": "stdio", "command": uvx, "args": uvx_args()}
     if style == "opencode":
-        return {"type": "local", "command": [uvx, PACKAGE], "enabled": True}
-    return {"command": uvx, "args": [PACKAGE]}
+        return {"type": "local", "command": [uvx, *uvx_args()], "enabled": True}
+    return {"command": uvx, "args": uvx_args()}
 
 
-def _entry_text(entry) -> str:
+def _entry_argv(entry) -> list[str]:
     """The command line an entry runs, to tell which package it points at."""
     if not isinstance(entry, dict):
-        return ""
+        return []
     parts = entry.get("command")
     parts = list(parts) if isinstance(parts, list) else [parts]
     args = entry.get("args")
     if isinstance(args, list):
         parts += args
-    return " ".join(str(p) for p in parts if p)
+    return [str(p) for p in parts if p]
+
+
+def _from_source(argv: list[str]) -> str | None:
+    """The `--from` a command line runs uvx with; None for the PyPI package."""
+    for i, arg in enumerate(argv):
+        if arg == "--from" and i + 1 < len(argv):
+            value = argv[i + 1]
+        elif arg.startswith("--from="):
+            value = arg[len("--from="):]
+        else:
+            continue
+        if _PYPI_FROM_RE.match(value) and "://" not in value:
+            return None
+        return value
+    return None
+
+
+def _same_source(a: str | None, b: str | None) -> bool:
+    if a is None or b is None:
+        return a is None and b is None
+    # A trailing slash or .git names the same repo.
+    a, b = (s.strip().rstrip("/").removesuffix(".git") for s in (a, b))
+    return a == b
+
+
+def _entry_status(argv: list[str]) -> tuple[str | None, str]:
+    """(CONFIGURED or OUTDATED, why it's outdated) for a command line that runs
+    this server, (None, "") for anything else."""
+    text = " ".join(argv)
+    if _NEW_RE.search(text):
+        source = _from_source(argv)
+        if _same_source(source, server_source()):
+            return CONFIGURED, ""
+        return OUTDATED, f"runs {PACKAGE} from {describe_source(source)}"
+    if _OLD_RE.search(text):
+        return OUTDATED, f"runs the old {OLD_PACKAGE} package"
+    return None, ""
+
+
+def _first_state(entries) -> ClientState:
+    """CONFIGURED if any (key, argv) runs the server from the current source,
+    else OUTDATED for the first one that runs it from elsewhere, else NEW."""
+    outdated = None
+    for key, argv in entries:
+        status, detail = _entry_status(argv)
+        if status == CONFIGURED:
+            return ClientState(CONFIGURED, key)
+        if status == OUTDATED and outdated is None:
+            outdated = ClientState(OUTDATED, key, detail)
+    return outdated or ClientState(NEW)
 
 
 def servers_state(servers: dict) -> ClientState:
-    """Whether a client's server map already runs this package."""
-    old_key = None
-    for key, entry in servers.items():
-        text = _entry_text(entry)
-        if _NEW_RE.search(text):
-            return ClientState(CONFIGURED, key)
-        if _OLD_RE.search(text) and old_key is None:
-            old_key = key
-    if old_key is not None:
-        return ClientState(OUTDATED, old_key)
-    return ClientState(NEW)
+    """Whether a client's server map already runs this package from the current source."""
+    return _first_state((key, _entry_argv(entry)) for key, entry in servers.items())
 
 
 def json_client_state(client: Client) -> ClientState:
@@ -410,6 +456,7 @@ def _codex_home(env) -> Path:
 
 
 _TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", re.MULTILINE)
+_TOML_STRING_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"|\'([^\'\n]*)\'')
 
 
 def _codex_mcp_sections(text: str) -> dict[str, str]:
@@ -427,6 +474,21 @@ def _codex_mcp_sections(text: str) -> dict[str, str]:
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
         sections[parts[1]] = sections.get(parts[1], "") + text[match.end():end]
     return sections
+
+
+def _toml_strings(body: str) -> list[str]:
+    """The quoted strings in a table body, in order: its command, args and env values."""
+    strings: list[str] = []
+    for match in _TOML_STRING_RE.finditer(body):
+        if match.group(1) is None:
+            strings.append(match.group(2))
+            continue
+        try:
+            # TOML's basic-string escapes are JSON's, near enough for paths and URLs.
+            strings.append(json.loads(f'"{match.group(1)}"'))
+        except json.JSONDecodeError:
+            strings.append(match.group(1))
+    return strings
 
 
 def codex_plugin_installed(env=None) -> bool:
@@ -451,13 +513,7 @@ def codex_state(env=None) -> ClientState:
         return ClientState(NEW)
     except OSError as e:
         return ClientState(UNREADABLE, detail=str(e))
-    old_key = None
-    for name, body in _codex_mcp_sections(text).items():
-        if _NEW_RE.search(body):
-            return ClientState(CONFIGURED, name)
-        if _OLD_RE.search(body) and old_key is None:
-            old_key = name
-    return ClientState(OUTDATED, old_key) if old_key else ClientState(NEW)
+    return _first_state((name, _toml_strings(body)) for name, body in _codex_mcp_sections(text).items())
 
 
 def _run_cli(args: list[str]) -> tuple[bool, str]:
@@ -475,12 +531,12 @@ def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str
     if client.kind == "claude-code":
         if state.status == OUTDATED:
             commands.append([client.cli_path, "mcp", "remove", "--scope", "user", key])
-        commands.append([client.cli_path, "mcp", "add", "--scope", "user", key, "--", uvx, PACKAGE])
+        commands.append([client.cli_path, "mcp", "add", "--scope", "user", key, "--", uvx, *uvx_args()])
     else:
         if state.status == OUTDATED:
             commands.append([client.cli_path, "mcp", "remove", key])
         env_flags = [flag for k, v in CODEX_ENV.items() for flag in ("--env", f"{k}={v}")]
-        commands.append([client.cli_path, "mcp", "add", key, *env_flags, "--", uvx, PACKAGE])
+        commands.append([client.cli_path, "mcp", "add", key, *env_flags, "--", uvx, *uvx_args()])
     return commands
 
 
@@ -722,7 +778,7 @@ def setup_addon(dry_run: bool) -> AddonOutcome:
 
 _STATUS_LABEL = {
     NEW: "will add",
-    OUTDATED: "will update from the old blender-mcp name",
+    OUTDATED: "will update",
     CONFIGURED: "already set up",
     UNREADABLE: "config isn't valid JSON, skipping",
 }
@@ -753,6 +809,7 @@ def _ask(prompt: str) -> str:
 
 def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool = False) -> int:
     print("MCP for Blender setup" + (" (dry run: nothing will be changed)" if dry_run else ""))
+    print(f"Server source: {describe_source(server_source())}")
     print()
 
     uvx = find_uvx()
@@ -772,7 +829,7 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
         width = max(len(c.name) for c, _ in states)
         for c, s in states:
             label = _STATUS_LABEL[s.status]
-            if s.status == CONFIGURED and s.detail:
+            if s.status in (CONFIGURED, OUTDATED) and s.detail:
                 label += f" ({s.detail})"
             print(f"  {c.name.ljust(width)}  {label}")
         print()

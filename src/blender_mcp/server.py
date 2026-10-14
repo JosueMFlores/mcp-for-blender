@@ -27,7 +27,8 @@ from .addon_manager import (
 )
 from .consent_prompt import maybe_prompt_for_consent
 from .premium_hint import premium_hint_once, premium_generation_guidance
-from . import blender_scripts, context_log, generation
+from . import blender_scripts, context_log, generation, guides
+from .distribution import REPO_URL, uvx_command
 from .safe_mode import safe_mode_enabled, validate_code, SandboxViolation, SAFE_MODE_ENV
 from .openai_apps import (
     APP_MIME_TYPE,
@@ -456,7 +457,7 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     on or off for this user. "(Premium)" ones come with MCP for Blender Premium and don't use the
     user's own API keys.
 
-    If outdated, tells the user how to update via `uvx mcp-for-blender install-addon`
+    If outdated, tells the user how to update with the returned `update_command`
     (then restart or re-enable the addon in Blender).
 
     `telemetry_consent` reports whether data collection is on, off, or null if
@@ -483,10 +484,10 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "source": result.source,
             "warning": result.warning,
             "telemetry_consent": get_telemetry().check_user_consent(),
-            "update_command": "uvx mcp-for-blender install-addon",
+            "update_command": uvx_command("install-addon"),
             "after_install": (
                 "If the addon file was updated: in Blender, Preferences → Add-ons → "
-                "disable/enable 'Interface: Blender MCP', or restart Blender, then Start MCP Server."
+                "disable/enable 'Interface: MCP for Blender', or restart Blender, then Start MCP Server."
             ),
         }
         return (json.dumps(payload, indent=2) + premium_generation_guidance(result.premium_generators)
@@ -540,7 +541,7 @@ def disable_telemetry(ctx: Context, user_prompt: str = "") -> str:
 #   (look -> the native screenshot, get_scene_info -> the addon's own summary).
 # tests/test_compat_matrix.py runs the tools against real past addons.
 
-ADDON_UPDATE_HINT = "Update the Blender addon: run `uvx mcp-for-blender install-addon`, then restart Blender."
+ADDON_UPDATE_HINT = f"Update the Blender addon: run `{uvx_command('install-addon')}`, then restart Blender."
 
 
 class AddonTooOld(Exception):
@@ -2072,6 +2073,7 @@ def _viewport_snapshot() -> tuple[dict, bytes | None]:
     # An addon older than this server can't pick objects, so the app says to
     # update it instead of quietly attaching only the image.
     state["addon_outdated"] = _addon_handshake is not None and not _addon_handshake.up_to_date
+    state["update_command"] = uvx_command("install-addon")
     return state, png
 
 
@@ -2220,8 +2222,8 @@ def main():
             "client (Claude Desktop, Cursor, VS Code, ...), not run by hand. "
             "It will now wait silently for a client on stdin -- that is normal, "
             "not a hang. Press Ctrl-C to exit. "
-            "Setup guide: https://github.com/ahujasid/blender-mcp#installation "
-            "(if the addon is outdated this logs how to update it: uvx mcp-for-blender install-addon)"
+            f"Setup guide: {REPO_URL}#quickstart "
+            f"(if the addon is outdated this logs how to update it: {uvx_command('install-addon')})"
         )
     context_log.install(mcp, SERVER_INSTRUCTIONS)
     mcp.run()

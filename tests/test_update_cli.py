@@ -14,6 +14,8 @@ from blender_mcp.addon_manager import (
     get_bundled_addon_path,
     update_installed_addons,
 )
+from blender_mcp.distribution import GIT_SOURCE, SOURCE_ENV
+from blender_mcp.setup_cli import OUTDATED, Client, ClientState
 from blender_mcp.update_cli import REEXEC_ENV, run_update, version_key
 
 BUNDLED = get_bundled_addon_path().read_text(encoding="utf-8")
@@ -97,13 +99,27 @@ def test_version_key():
 def quiet(monkeypatch):
     """No clients, Blender or addon installs on the test machine leak in."""
     monkeypatch.delenv(REEXEC_ENV, raising=False)
+    monkeypatch.delenv(SOURCE_ENV, raising=False)
     monkeypatch.setattr(update_cli, "detect_clients", lambda: [])
     monkeypatch.setattr(update_cli, "blender_is_running", lambda: False)
     monkeypatch.setattr(update_cli, "update_installed_addons", lambda dry_run=False: [])
     monkeypatch.setattr(update_cli, "current_version", lambda: "2.1.0")
 
 
-def test_newer_release_reruns_from_it_through_uvx(quiet, monkeypatch):
+@pytest.fixture
+def pypi(quiet, monkeypatch):
+    """BLENDER_MCP_SOURCE=pypi: upstream's package and its release checks."""
+    monkeypatch.setenv(SOURCE_ENV, "pypi")
+
+
+def _record_runs(monkeypatch, calls):
+    monkeypatch.setattr(update_cli.subprocess, "run",
+                        lambda cmd, env=None, **kw: calls.append((cmd, env)) or types.SimpleNamespace(returncode=0))
+
+
+# --- from PyPI ---------------------------------------------------------------
+
+def test_newer_release_reruns_from_it_through_uvx(pypi, monkeypatch):
     calls = []
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.2.0", ""))
     monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
@@ -116,7 +132,7 @@ def test_newer_release_reruns_from_it_through_uvx(quiet, monkeypatch):
     assert env[REEXEC_ENV] == "2.1.0"
 
 
-def test_uv_tool_install_is_upgraded_first(quiet, monkeypatch):
+def test_uv_tool_install_is_upgraded_first(pypi, monkeypatch):
     calls = []
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.2.0", ""))
     monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
@@ -129,16 +145,17 @@ def test_uv_tool_install_is_upgraded_first(quiet, monkeypatch):
     assert calls[1][0] == "/abs/uvx"
 
 
-def test_latest_release_updates_addon_without_rerunning(quiet, monkeypatch, capsys):
+def test_latest_release_updates_addon_without_rerunning(pypi, monkeypatch, capsys):
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.1.0", ""))
     monkeypatch.setattr(update_cli.subprocess, "run", lambda *a, **kw: pytest.fail("should not re-run"))
     assert run_update() == 0
     out = capsys.readouterr().out
+    assert "Server source: PyPI" in out
     assert "2.1.0, the latest release" in out
-    assert "setup" in out  # addon not installed → points at setup
+    assert "`uvx mcp-for-blender setup`" in out  # addon not installed → points at setup
 
 
-def test_rerun_does_not_check_pypi_again(quiet, monkeypatch, capsys):
+def test_rerun_does_not_check_pypi_again(pypi, monkeypatch, capsys):
     monkeypatch.setenv(REEXEC_ENV, "2.0.0")
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: pytest.fail("should not loop"))
     assert run_update() == 0
@@ -147,14 +164,101 @@ def test_rerun_does_not_check_pypi_again(quiet, monkeypatch, capsys):
     assert "Restart your MCP clients" in out
 
 
-def test_offline_still_updates_addon(quiet, monkeypatch, capsys):
+def test_offline_still_updates_addon(pypi, monkeypatch, capsys):
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: (None, "no network"))
     assert run_update() == 0
     assert "couldn't check PyPI" in capsys.readouterr().out
 
 
-def test_without_uvx_points_at_pip(quiet, monkeypatch, capsys):
+def test_without_uvx_points_at_pip(pypi, monkeypatch, capsys):
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.2.0", ""))
     monkeypatch.setattr(update_cli, "find_uvx", lambda: None)
     assert run_update() == 1
     assert "pip install -U mcp-for-blender" in capsys.readouterr().out
+
+
+# --- from this fork's repo (the default) ------------------------------------
+
+def test_git_source_always_refreshes_from_it(quiet, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: pytest.fail("no PyPI release to compare"))
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    monkeypatch.setattr(update_cli, "find_uv", lambda uvx: None)
+    _record_runs(monkeypatch, calls)
+    assert run_update() == 0
+    [(cmd, env)] = calls
+    assert cmd == ["/abs/uvx", "--refresh-package", "mcp-for-blender",
+                   "--from", GIT_SOURCE, "mcp-for-blender", "update"]
+    assert env[REEXEC_ENV] == "2.1.0"
+    out = capsys.readouterr().out
+    assert f"Server source: {GIT_SOURCE}" in out
+    assert f"refreshing from {GIT_SOURCE}" in out
+
+
+def test_git_source_dry_run_passes_it_on(quiet, monkeypatch):
+    calls = []
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    monkeypatch.setattr(update_cli, "find_uv", lambda uvx: "/abs/uv")
+    monkeypatch.setattr(update_cli, "uv_tool_installed", lambda uv: True)
+    _record_runs(monkeypatch, calls)
+    assert run_update(dry_run=True) == 0
+    [(cmd, _)] = calls  # the uv tool upgrade is only printed
+    assert cmd[-2:] == ["update", "--dry-run"]
+
+
+def test_git_source_upgrades_uv_tool_install_first(quiet, monkeypatch):
+    calls = []
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    monkeypatch.setattr(update_cli, "find_uv", lambda uvx: "/abs/uv")
+    monkeypatch.setattr(update_cli, "uv_tool_installed", lambda uv: True)
+    _record_runs(monkeypatch, calls)
+    assert run_update() == 0
+    assert [cmd for cmd, _ in calls] == [
+        ["/abs/uv", "tool", "upgrade", "mcp-for-blender"],
+        ["/abs/uvx", "--refresh-package", "mcp-for-blender", "--from", GIT_SOURCE, "mcp-for-blender", "update"],
+    ]
+
+
+def test_custom_source_is_refreshed_from(quiet, monkeypatch):
+    calls = []
+    monkeypatch.setenv(SOURCE_ENV, "/src/checkout")
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    monkeypatch.setattr(update_cli, "find_uv", lambda uvx: None)
+    _record_runs(monkeypatch, calls)
+    assert run_update() == 0
+    [(cmd, _)] = calls
+    assert cmd[3:] == ["--from", "/src/checkout", "mcp-for-blender", "update"]
+
+
+@pytest.mark.parametrize("updated_from, line", [
+    ("2.1.0", f"refreshed 2.1.0 from {GIT_SOURCE}"),
+    ("2.0.0", "updated 2.0.0 → 2.1.0"),
+])
+def test_git_source_rerun_does_not_loop(quiet, monkeypatch, capsys, updated_from, line):
+    monkeypatch.setenv(REEXEC_ENV, updated_from)
+    monkeypatch.setattr(update_cli.subprocess, "run", lambda *a, **kw: pytest.fail("should not loop"))
+    assert run_update() == 0
+    out = capsys.readouterr().out
+    assert line in out
+    assert "Restart your MCP clients" in out
+
+
+def test_git_source_without_uvx_still_updates_addon(quiet, monkeypatch, capsys):
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: None)
+    monkeypatch.setattr(update_cli.subprocess, "run", lambda *a, **kw: pytest.fail("nothing to run"))
+    assert run_update() == 0
+    out = capsys.readouterr().out
+    assert f"Update the server with `pip install -U {GIT_SOURCE}`" in out
+    assert "Blender addon:" in out
+    assert "Nothing to do" not in out
+
+
+def test_points_clients_on_another_source_at_setup(quiet, monkeypatch, capsys):
+    monkeypatch.setenv(REEXEC_ENV, "2.1.0")
+    monkeypatch.setattr(update_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json")])
+    monkeypatch.setattr(update_cli, "client_state",
+                        lambda c: ClientState(OUTDATED, "blender", "runs mcp-for-blender from PyPI"))
+    assert run_update() == 0
+    out = capsys.readouterr().out
+    assert "Cursor (runs mcp-for-blender from PyPI)" in out
+    assert f"`uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out

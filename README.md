@@ -31,6 +31,45 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 
 </div>
 
+## About this fork
+
+This is [JosueMFlores/mcp-for-blender](https://github.com/JosueMFlores/mcp-for-blender), a fork of
+[ahujasid/blender-mcp](https://github.com/ahujasid/blender-mcp). What's different:
+
+- **Installs and updates from this repo.** The installers, `setup` and `update` run the server with
+  `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender` instead of the `mcp-for-blender`
+  package on PyPI, which upstream publishes. Install-command hints printed by the server point here too.
+- **The addon's self-updater follows this repo**, so updating from inside Blender never swaps in upstream's addon.
+- **Telemetry is off** unless you configure it.
+- **Roblox export preset** for `export_scene`, with a guide.
+- **CI** runs the test suite on every push and pull request.
+
+```bash
+# macOS / Linux
+curl -LsSf https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.ps1 | iex"
+```
+
+Already have uv? Run `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup`, and
+`uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender update` to update later.
+Installing from GitHub needs `git`.
+
+Elsewhere in this README, a bare `uvx mcp-for-blender …` runs upstream's PyPI package; add
+`--from git+https://github.com/JosueMFlores/mcp-for-blender` after `uvx` to run this fork's.
+
+`BLENDER_MCP_SOURCE` picks where `setup`, `update` and the installers get the server from: unset for this
+fork, `pypi` for upstream's PyPI package, or any other uvx `--from` spec (another git URL, a local checkout).
+To go back to upstream, rewrite your clients' entries and reinstall upstream's addon:
+
+```bash
+BLENDER_MCP_SOURCE=pypi uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup --skip-addon
+uvx mcp-for-blender install-addon
+```
+
 ---
 
 ## Quickstart
@@ -45,16 +84,16 @@ Prompt-assisted 3D modeling, scene creation, and manipulation — driven by AI.
 **macOS / Linux**
 
 ```bash
-curl -LsSf https://www.mcp-for-blender.com/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.sh | sh
 ```
 
 **Windows** (PowerShell)
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://www.mcp-for-blender.com/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.ps1 | iex"
 ```
 
-Already have uv? Run `uvx mcp-for-blender setup` instead.
+Already have uv? Run `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup` instead.
 
 It installs [uv](https://docs.astral.sh/uv/) if needed, finds the MCP clients on your machine (Claude Desktop, Claude Code, Codex, Cursor, VS Code, Devin Desktop/Windsurf, OpenCode, Antigravity), and lets you pick which to set up. Then it installs the Blender addon and enables it. Your existing config is kept: it only adds a `blender` entry and saves a `.bak` of each file it changes.
 
@@ -91,7 +130,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
     "mcpServers": {
         "blender": {
             "command": "uvx",
-            "args": ["mcp-for-blender"]
+            "args": ["--from", "git+https://github.com/JosueMFlores/mcp-for-blender", "mcp-for-blender"]
         }
     }
 }
@@ -102,7 +141,7 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 <summary><b>Claude Code</b></summary>
 
 ```bash
-claude mcp add blender uvx mcp-for-blender
+claude mcp add blender -- uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender
 ```
 </details>
 
@@ -110,7 +149,7 @@ claude mcp add blender uvx mcp-for-blender
 <summary><b>Codex</b></summary>
 
 ```bash
-codex mcp add blender -- uvx mcp-for-blender
+codex mcp add blender -- uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender
 ```
 </details>
 
@@ -123,7 +162,7 @@ See [MCP Client Setup](#mcp-client-setup) below for per-client instructions and 
 **3. Install the Blender addon**
 
 ```bash
-uvx mcp-for-blender install-addon
+uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender install-addon
 ```
 
 Then in Blender: **Edit → Preferences → Add-ons** → enable **Interface: MCP for Blender**.

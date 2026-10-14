@@ -142,7 +142,7 @@
   const $ = (id) => document.getElementById(id);
   const state = {
     seq: 0, image: null, capturedAt: null, source: null, file: null, scene: null, sceneCount: null,
-    pickable: false, addonOutdated: false, stale: false, quiet: true,
+    pickable: false, addonOutdated: false, updateCommand: null, stale: false, quiet: true,
     capturing: false, autoBlockedUntil: 0,
     displayMode: null,
     canAttach: false, canLink: false,
@@ -233,6 +233,7 @@
     if (typeof s.stale === "boolean") state.stale = s.stale;
     if (typeof s.blender_quiet === "boolean") state.quiet = s.blender_quiet;
     if (typeof s.addon_outdated === "boolean") state.addonOutdated = s.addon_outdated;
+    if (typeof s.update_command === "string") state.updateCommand = s.update_command;
     render();
   }
 
@@ -291,7 +292,8 @@
       : shown.length ? "Attached to your next message. Click more objects, or empty space to attach just the view."
       : state.pickable ? "Click an object to mention it in your next message."
       : state.addonOutdated ? "Click the image to attach it to your next message. To click on objects, "
-        + "update the Blender addon (uvx mcp-for-blender install-addon) and restart Blender."
+        + "update the Blender addon (" + (state.updateCommand || "mcp-for-blender install-addon")
+        + ") and restart Blender."
       : "Click the image to attach it to your next message.";
     for (const el of $("stage").querySelectorAll(".marker")) el.remove();
     for (const pick of shown) {

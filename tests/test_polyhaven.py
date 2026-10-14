@@ -1821,7 +1821,7 @@ def test_poly_haven_requests_identify_the_integration(server, monkeypatch):
     assert agents, "no requests were made"
     for agent in agents:
         assert agent.startswith("blender-mcp/"), agent
-        assert "github.com/ahujasid/blender-mcp" in agent
+        assert "github.com/JosueMFlores/mcp-for-blender" in agent
     assert addon.REQ_HEADERS["User-Agent"] == "blender-mcp", "Poly Pizza's header is unchanged"
 
 

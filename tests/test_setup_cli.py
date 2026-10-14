@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from blender_mcp import setup_cli
+from blender_mcp.distribution import GIT_SOURCE, SOURCE_ENV
 from blender_mcp.setup_cli import (
     CONFIGURED,
     NEW,
@@ -27,6 +28,18 @@ from blender_mcp.setup_cli import (
 )
 
 UVX = "/abs/bin/uvx"
+# What entries run by default: the server from this fork's repo.
+FORK_ARGS = ["--from", GIT_SOURCE, "mcp-for-blender"]
+
+
+@pytest.fixture(autouse=True)
+def default_source(monkeypatch):
+    monkeypatch.delenv(SOURCE_ENV, raising=False)
+
+
+@pytest.fixture
+def pypi(monkeypatch):
+    monkeypatch.setenv(SOURCE_ENV, "pypi")
 
 
 @pytest.fixture
@@ -56,7 +69,7 @@ def test_adds_entry_and_keeps_other_servers(tmp_path):
     assert result.ok
     data = json.loads(path.read_text())
     assert data["mcpServers"]["other"] == {"command": "npx", "args": ["x"]}
-    assert data["mcpServers"]["blender"] == {"command": UVX, "args": ["mcp-for-blender"]}
+    assert data["mcpServers"]["blender"] == {"command": UVX, "args": FORK_ARGS}
     assert data["theme"] == "dark"
     assert result.backup and json.loads(result.backup.read_text())["mcpServers"].keys() == {"other"}
 
@@ -65,20 +78,20 @@ def test_creates_missing_file_without_backup(tmp_path):
     path = tmp_path / "sub" / "mcp.json"
     result = configure_json_client(_client(path), UVX, ClientState(NEW))
     assert result.ok and result.backup is None
-    assert json.loads(path.read_text()) == {"mcpServers": {"blender": {"command": UVX, "args": ["mcp-for-blender"]}}}
+    assert json.loads(path.read_text()) == {"mcpServers": {"blender": {"command": UVX, "args": FORK_ARGS}}}
 
 
 def test_vscode_and_opencode_formats(tmp_path):
     vscode = tmp_path / "mcp.json"
     configure_json_client(_client(vscode, "vscode"), UVX, ClientState(NEW))
     assert json.loads(vscode.read_text()) == {
-        "servers": {"blender": {"type": "stdio", "command": UVX, "args": ["mcp-for-blender"]}}
+        "servers": {"blender": {"type": "stdio", "command": UVX, "args": FORK_ARGS}}
     }
 
     opencode = tmp_path / "opencode.json"
     configure_json_client(_client(opencode, "opencode"), UVX, ClientState(NEW))
     data = json.loads(opencode.read_text())
-    assert data["mcp"]["blender"] == {"type": "local", "command": [UVX, "mcp-for-blender"], "enabled": True}
+    assert data["mcp"]["blender"] == {"type": "local", "command": [UVX, *FORK_ARGS], "enabled": True}
     assert data["$schema"] == "https://opencode.ai/config.json"
 
 
@@ -88,7 +101,7 @@ def test_does_not_take_over_an_unrelated_blender_entry(tmp_path):
     configure_json_client(_client(path), UVX, ClientState(NEW))
     servers = json.loads(path.read_text())["mcpServers"]
     assert servers["blender"] == {"command": "some-other-blender-tool"}
-    assert servers["blender-2"]["args"] == ["mcp-for-blender"]
+    assert servers["blender-2"]["args"] == FORK_ARGS
 
 
 def test_update_replaces_old_package_and_keeps_env(tmp_path):
@@ -98,11 +111,27 @@ def test_update_replaces_old_package_and_keeps_env(tmp_path):
     client = _client(path)
 
     state = json_client_state(client)
-    assert (state.status, state.entry_key) == (OUTDATED, "blender-mcp")
+    assert (state.status, state.entry_key, state.detail) == (OUTDATED, "blender-mcp", "runs the old blender-mcp package")
     configure_json_client(client, UVX, state)
 
     entry = json.loads(path.read_text())["mcpServers"]["blender-mcp"]
-    assert entry == {"command": UVX, "args": ["mcp-for-blender"], "env": {"BLENDER_PORT": "9877"}}
+    assert entry == {"command": UVX, "args": FORK_ARGS, "env": {"BLENDER_PORT": "9877"}}
+    assert json_client_state(client).status == CONFIGURED
+
+
+def test_update_moves_pypi_entry_to_this_fork_in_place(tmp_path):
+    path = tmp_path / "mcp.json"
+    _write(path, {"mcpServers": {"my-blender": {
+        "command": "uvx", "args": ["mcp-for-blender"], "env": {"BLENDER_PORT": "9877"}, "disabled": False}}})
+    client = _client(path)
+
+    state = json_client_state(client)
+    assert (state.status, state.entry_key, state.detail) == (OUTDATED, "my-blender", "runs mcp-for-blender from PyPI")
+    result = configure_json_client(client, UVX, state)
+
+    assert result.ok and result.message.startswith('Updated "my-blender"')
+    assert json.loads(path.read_text())["mcpServers"] == {"my-blender": {
+        "command": UVX, "args": FORK_ARGS, "env": {"BLENDER_PORT": "9877"}, "disabled": False}}
     assert json_client_state(client).status == CONFIGURED
 
 
@@ -125,13 +154,59 @@ def test_strip_jsonc_keeps_strings():
         "url": "http://x/*y*/", "a": [1]}
 
 
+def _state(*args, command="/x/uvx"):
+    return servers_state({"b": {"command": command, "args": list(args)}})
+
+
 def test_servers_state():
     assert servers_state({}).status == NEW
-    assert servers_state({"b": {"command": "/x/uvx", "args": ["mcp-for-blender"]}}).status == CONFIGURED
-    assert servers_state({"b": {"command": ["uvx", "blender-mcp"]}}).status == OUTDATED
-    # pipx installs run the package's own command
-    assert servers_state({"b": {"command": "mcp-for-blender"}}).status == CONFIGURED
-    assert servers_state({"b": {"command": "uvx", "args": ["blender-mcp-extras"]}}).status == NEW
+    assert _state(*FORK_ARGS).status == CONFIGURED
+    # The same repo written another way.
+    assert _state("--from", GIT_SOURCE + ".git", "mcp-for-blender").status == CONFIGURED
+    assert _state("--from=" + GIT_SOURCE + "/", "mcp-for-blender").status == CONFIGURED
+    assert _state("blender-mcp-extras", command="uvx").status == NEW
+
+
+@pytest.mark.parametrize("args, command, detail", [
+    (["mcp-for-blender"], "/x/uvx", "runs mcp-for-blender from PyPI"),
+    (["mcp-for-blender@latest"], "/x/uvx", "runs mcp-for-blender from PyPI"),
+    (["--from", "mcp-for-blender==2.1.0", "mcp-for-blender"], "/x/uvx", "runs mcp-for-blender from PyPI"),
+    ([], "mcp-for-blender", "runs mcp-for-blender from PyPI"),  # pipx runs the package's own command
+    (["--from", "git+https://github.com/ahujasid/blender-mcp", "mcp-for-blender"], "uvx",
+     "runs mcp-for-blender from git+https://github.com/ahujasid/blender-mcp"),
+    (["blender-mcp"], "uvx", "runs the old blender-mcp package"),
+])
+def test_entries_from_elsewhere_are_outdated(args, command, detail):
+    state = _state(*args, command=command)
+    assert (state.status, state.entry_key, state.detail) == (OUTDATED, "b", detail)
+
+
+def test_an_entry_already_on_this_fork_wins():
+    servers = {"old": {"command": "uvx", "args": ["mcp-for-blender"]}, "new": {"command": "uvx", "args": FORK_ARGS}}
+    assert (servers_state(servers).status, servers_state(servers).entry_key) == (CONFIGURED, "new")
+
+
+def test_pypi_source_keeps_upstream_behaviour(pypi):
+    assert _state("mcp-for-blender").status == CONFIGURED
+    assert _state("mcp-for-blender@latest").status == CONFIGURED
+    assert _state(command="mcp-for-blender").status == CONFIGURED
+    assert _state("blender-mcp").status == OUTDATED
+    # Going back to upstream rewrites entries that run this fork.
+    assert _state(*FORK_ARGS).status == OUTDATED
+    assert setup_cli.server_entry("mcpServers", UVX) == {"command": UVX, "args": ["mcp-for-blender"]}
+    client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    [add] = setup_cli._cli_commands(client, UVX, ClientState(NEW))
+    assert add[-2:] == [UVX, "mcp-for-blender"]
+
+
+def test_custom_source_is_written_and_recognised(monkeypatch, tmp_path):
+    monkeypatch.setenv(SOURCE_ENV, "/src/my checkout")
+    path = tmp_path / "mcp.json"
+    configure_json_client(_client(path), UVX, ClientState(NEW))
+    assert json.loads(path.read_text())["mcpServers"]["blender"]["args"] == [
+        "--from", "/src/my checkout", "mcp-for-blender"]
+    assert json_client_state(_client(path)).status == CONFIGURED
+    assert _state(*FORK_ARGS).status == OUTDATED
 
 
 # --- Codex -------------------------------------------------------------------
@@ -148,6 +223,20 @@ def test_codex_state_reads_config_toml(tmp_path):
     assert (state.status, state.entry_key) == (OUTDATED, "blender")
 
     (tmp_path / "config.toml").write_text('[mcp_servers."my blender"]\ncommand = "/x/uvx"\nargs = ["mcp-for-blender"]\n')
+    state = codex_state(env)
+    assert (state.status, state.entry_key, state.detail) == (OUTDATED, "my blender", "runs mcp-for-blender from PyPI")
+
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.blender]\ncommand = \'C:\\uv\\uvx.exe\'\n'
+        f'args = ["--from", "{GIT_SOURCE}", "mcp-for-blender"]\n'
+        '[mcp_servers.blender.env]\nBLENDER_MCP_APPS = "1"\n'
+    )
+    assert codex_state(env).status == CONFIGURED
+
+
+def test_codex_state_with_pypi_source(tmp_path, pypi):
+    env = {"CODEX_HOME": str(tmp_path)}
+    (tmp_path / "config.toml").write_text('[mcp_servers.blender]\ncommand = "/x/uvx"\nargs = ["mcp-for-blender"]\n')
     assert codex_state(env).status == CONFIGURED
 
 
@@ -161,7 +250,7 @@ def test_codex_commands_carry_plugin_env():
     client = Client("codex", "Codex", "codex", cli_path="/bin/codex")
     [add] = setup_cli._cli_commands(client, UVX, ClientState(NEW))
     assert add == ["/bin/codex", "mcp", "add", "blender", "--env", "BLENDER_MCP_APPS=1",
-                   "--env", "BLENDER_MCP_OPENAI_FORMS=1", "--", UVX, "mcp-for-blender"]
+                   "--env", "BLENDER_MCP_OPENAI_FORMS=1", "--", UVX, *FORK_ARGS]
     remove, add = setup_cli._cli_commands(client, UVX, ClientState(OUTDATED, "blender-mcp"))
     assert remove == ["/bin/codex", "mcp", "remove", "blender-mcp"]
     assert add[3] == "blender-mcp"
@@ -170,7 +259,19 @@ def test_codex_commands_carry_plugin_env():
 def test_claude_code_uses_user_scope():
     client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
     [add] = setup_cli._cli_commands(client, UVX, ClientState(NEW))
-    assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, "mcp-for-blender"]
+    assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, *FORK_ARGS]
+
+
+def test_claude_code_moves_pypi_entry_to_this_fork(tmp_path, monkeypatch):
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"type": "stdio", "command": "uvx",
+                                                                  "args": ["mcp-for-blender"]}}})
+    state = setup_cli.claude_code_state()
+    assert (state.status, state.entry_key) == (OUTDATED, "blender")
+    client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
+    remove, add = setup_cli._cli_commands(client, UVX, state)
+    assert remove == ["/bin/claude", "mcp", "remove", "--scope", "user", "blender"]
+    assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, *FORK_ARGS]
 
 
 # --- detection ---------------------------------------------------------------
@@ -260,7 +361,7 @@ def test_dry_run_changes_nothing(home, monkeypatch, capsys):
 def test_run_setup_configures_and_skips_configured(home, monkeypatch, capsys):
     cursor = home / ".cursor" / "mcp.json"
     vscode = home / "vscode" / "mcp.json"
-    _write(vscode, {"servers": {"blender": {"command": "uvx", "args": ["mcp-for-blender"]}}})
+    _write(vscode, {"servers": {"blender": {"command": "uvx", "args": FORK_ARGS}}})
     vscode_before = vscode.read_text()
     monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
     monkeypatch.setattr(setup_cli, "detect_clients", lambda: [
@@ -273,6 +374,20 @@ def test_run_setup_configures_and_skips_configured(home, monkeypatch, capsys):
     assert vscode.read_text() == vscode_before
     out = capsys.readouterr().out
     assert "already set up" in out and "Restart Cursor." in out
+    assert f"Server source: {GIT_SOURCE}" in out
+
+
+def test_run_setup_moves_pypi_entries_to_this_fork(home, monkeypatch, capsys):
+    cursor = home / ".cursor" / "mcp.json"
+    _write(cursor, {"mcpServers": {"blender": {"command": "uvx", "args": ["mcp-for-blender"]}}})
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"] == {"blender": {"command": UVX, "args": FORK_ARGS}}
+    out = capsys.readouterr().out
+    assert "will update (runs mcp-for-blender from PyPI)" in out
+    assert 'Updated "blender"' in out
 
 
 def test_run_setup_needs_uvx(monkeypatch, capsys):

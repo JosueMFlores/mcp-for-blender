@@ -268,7 +268,7 @@ POLYHAVEN_API_BASE = "https://api.polyhaven.com"
 POLYHAVEN_HEADERS = dict(REQ_HEADERS)
 POLYHAVEN_HEADERS["User-Agent"] = (
     "blender-mcp/" + ".".join(str(part) for part in bl_info["version"])
-    + " (+https://github.com/ahujasid/blender-mcp)"
+    + " (+https://github.com/JosueMFlores/mcp-for-blender)"
 )
 
 # (connect, read). The read timeout applies per socket read rather than to the
@@ -6047,8 +6047,8 @@ class BLENDERMCP_OT_StopServer(bpy.types.Operator):
 # The addon updates itself from the open-source repo. An update is offered only
 # when main carries a strictly newer (version, protocol), so a local build that
 # is ahead of main is never "updated" backwards.
-ADDON_UPDATE_URL = "https://raw.githubusercontent.com/ahujasid/blender-mcp/main/addon.py"
-ADDON_CHANGES_URL = "https://github.com/ahujasid/blender-mcp/commits/main/addon.py"
+ADDON_UPDATE_URL = "https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/addon.py"
+ADDON_CHANGES_URL = "https://github.com/JosueMFlores/mcp-for-blender/commits/main/addon.py"
 ADDON_UPDATE_CHECK_ENV = "BLENDERMCP_NO_UPDATE_CHECK"
 
 _ADDON_VERSION_RE = re.compile(r'"version":\s*\((\d+)\s*,\s*(\d+)(?:\s*,\s*(\d+))?\s*\)')
@@ -6201,7 +6201,7 @@ class BLENDERMCP_OT_OpenTerms(bpy.types.Operator):
 
     def execute(self, context):
         # Open the Terms and Conditions on GitHub
-        terms_url = "https://github.com/ahujasid/blender-mcp/blob/main/TERMS_AND_CONDITIONS.md"
+        terms_url = "https://github.com/JosueMFlores/mcp-for-blender/blob/main/TERMS_AND_CONDITIONS.md"
         try:
             import webbrowser
             webbrowser.open(terms_url)

@@ -3,6 +3,8 @@
     "mcp-for-blender": {
       "command": "uvx",
       "args": [
+        "--from",
+        "git+https://github.com/JosueMFlores/mcp-for-blender",
         "mcp-for-blender"
       ],
       "env_vars": [

@@ -302,6 +302,8 @@ def test_viewport_state_says_when_the_addon_is_too_old_to_pick(monkeypatch):
     assert server.viewport_capture().structuredContent["addon_outdated"] is False
     monkeypatch.setattr(server, "_addon_handshake", types.SimpleNamespace(up_to_date=False))
     assert server.viewport_capture().structuredContent["addon_outdated"] is True
+    # The app shows this command, so it must install this fork's addon.
+    assert server.viewport_capture().structuredContent["update_command"] == server.uvx_command("install-addon")
 
 
 def test_model_screenshots_reach_the_viewport_app(monkeypatch):

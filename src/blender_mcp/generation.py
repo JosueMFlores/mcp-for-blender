@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import urlparse
 
+from .distribution import uvx_command
+
 logger = logging.getLogger("BlenderMCPServer")
 
 PROVIDERS = ("tripo", "hunyuan3d", "hyper3d")
@@ -41,7 +43,7 @@ MAX_CALL_S = 45.0
 PENDING_MAX_AGE_S = 2 * 3600
 
 TRIPO_UNAVAILABLE = ("Tripo is only available with MCP for Blender Premium. If Premium is on, update the Blender "
-                     "addon: run `uvx mcp-for-blender install-addon`, then restart Blender.")
+                     f"addon: run `{uvx_command('install-addon')}`, then restart Blender.")
 
 Send = Callable[[str, dict], Any]
 Progress = Callable[[float, float], Awaitable[None]]
