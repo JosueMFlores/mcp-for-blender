@@ -44,6 +44,7 @@ This is [JosueMFlores/mcp-for-blender](https://github.com/JosueMFlores/mcp-for-b
 - **The addon's self-updater follows this repo**, so updating from inside Blender never swaps in upstream's addon.
 - **Telemetry is off** unless you configure it.
 - **Roblox export preset** for `export_scene`, with a guide.
+- **Recovery copies, background operations and reusable recipes** (addon protocol 15).
 - **CI** runs the test suite on every push and pull request.
 
 ```bash
@@ -230,6 +231,103 @@ The addon starts its server when Blender opens. To check, press `N` in the 3D vi
 | **Visual verification** | Multi-angle, camera, wireframe, X-ray and animation-strip views, plus renders, so the AI checks its own work |
 | **Code execution** | The AI writes Blender Python directly |
 | **Asset & model generation** | Poly Haven assets, Sketchfab models, Poly Pizza low-poly models, and AI-generated 3D models via Tripo, Hyper3D Rodin and Hunyuan3D |
+
+## Recovery, background operations and recipes
+
+These additions are available in this fork. Install the matching server and addon together;
+re-enable the addon or restart Blender, then reconnect your MCP client to refresh its tool list.
+From a source checkout, `uv run mcp-for-blender install-addon` installs this checkout's addon,
+and `uv run mcp-for-blender` starts this checkout's server. A client pinned to a remote commit
+continues to use that commit until updated; editing a local checkout does not update it.
+
+### Recovery copies
+
+`checkpoint_scene(action="create", label="Before retopology")` saves a separate `.blend` copy
+and returns a `checkpoint_id`. Use `action="list"` to see the latest ten copies in the current
+Blender addon session, and `action="restore", checkpoint_id="..."` to open one. Restoring first
+saves another copy of the current state. It leaves the original project file untouched and
+opens the recovered copy with automatic Python scripts disabled; use **Save As** to choose
+where to save subsequent edits. The current window layout is retained.
+
+`execute_blender_code(code="...", checkpoint=True)` creates a recovery point before executing
+the script and includes its ID even if the script fails. A failed save prevents the script
+from running. Recovery is manual: it restores Blender data, not external files written by a
+script. Temporary copies and their index survive loading another file and MCP reconnection,
+but their IDs are scoped to the Blender addon session; restarting/reloading the addon starts
+a new recovery session. Checkpoint tools require addon protocol 15; older addons receive an
+update message rather than silently executing without the requested protection.
+
+### Long operations
+
+`run_operation` returns immediately with an operation `id`. One worker serializes queued
+work; up to sixteen jobs can wait behind it. `operation_status(id="...")` reads state,
+workflow-stage progress, result, error and `recovery_checkpoint` without contacting Blender.
+`wait_seconds` optionally waits up to thirty seconds. `action="list"` lists recent jobs;
+`action="cancel"` cancels queued jobs. A running Blender operator cannot be forcibly stopped
+safely: cancellation is advisory and the operation may still finish.
+
+For example, the tool arguments for preparing a model in the background are:
+
+```json
+{
+  "kind": "recipe",
+  "arguments": {
+    "name": "prepare_game_asset",
+    "object_names": ["Crate"],
+    "options": {"triangle_budget": 5000}
+  },
+  "request_id": "crate-game-copy-v1"
+}
+```
+
+Supported `kind` values:
+
+| Kind | Arguments |
+|---|---|
+| `code` | `code`: Python to run in Blender |
+| `recipe` | `name`, `object_names`, optional `options` |
+| `render` | Optional `filepath` and `animation` (defaults to a still render) |
+| `import_asset` | The same arguments as `import_asset`, excluding `ctx` and `user_prompt` |
+| `generate_3d` | The same arguments as `generate_3d`, excluding `ctx`, `user_prompt` and `wait_seconds` |
+
+Recovery is enabled by default; `checkpoint=False` opts out. Poll the returned ID instead of
+submitting again. Identical requests return the existing operation; set a fresh `request_id`
+to intentionally repeat an operation. Reusing an ID with different arguments is rejected.
+The last hundred jobs are retained. Metadata is saved locally per Blender endpoint, without
+scripts, prompts or credentials; free-text results are available in memory and redacted on
+disk. Reloaded results are marked `result_redacted`. Jobs active at MCP restart become
+`interrupted` and are never replayed. Inspect Blender before retrying a paid generation.
+
+Local Hunyuan HTTP generation now runs in the MCP worker process and imports the completed
+GLB on Blender's main thread. Normal `generate_3d` calls route local Hunyuan to a background
+operation too. This fixes the previous mismatch between a ten-minute generator request and
+a three-minute socket deadline. Reference image paths for this route are read on the MCP
+server's machine; use an HTTP image URL when Blender runs on a different host. Responses are
+limited to 128 MiB for GLB models and 16 MiB for reference images. Other synchronous Blender
+operators, including rendering and existing asset downloads, can still occupy Blender's UI,
+but the MCP remains responsive to operation-status requests. Progress describes real workflow
+stages rather than estimated render percentages. Closing the MCP session prevents a pending
+HTTP generation from reconnecting later and importing into Blender.
+
+### Reusable recipes
+
+Call `run_recipe()` without a name for the complete catalog and supported options. Named
+recipes require explicit `object_names` and save a recovery point by default:
+
+| Recipe | Behavior |
+|---|---|
+| `prepare_game_asset` | Creates static mesh copies in a new collection; bakes evaluated geometry and world rotation/scale; adds missing UVs; optionally decimates and triangulates; reports actual triangle counts and budget warnings. |
+| `product_lighting` | Adds a framed studio camera and three area lights in a new collection; optionally assigns the new scene camera. |
+| `create_variants` | Creates spaced copies along X, Y or Z, preserving selected parent/child relationships; copies data unless `linked_data=True`. |
+
+The originals remain in the scene and the user's selection and mode are restored after the
+recipe. Game preparation bakes rigging, animation and modifiers at the current frame, so use
+it for static props rather than animated characters. Existing lights remain active when a
+studio is added. Use `run_operation(kind="recipe", arguments={...})` for large targets.
+
+Development checks: `uv run --frozen pytest -q` and `uv run --frozen ruff check .`.
+For a real Blender check on an isolated factory scene, run
+`blender -b --factory-startup --python-exit-code 1 --python tests/blender_smoke.py`.
 
 ## Premium
 

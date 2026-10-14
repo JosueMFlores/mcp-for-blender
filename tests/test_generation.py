@@ -6,11 +6,24 @@ subscription keys, and Tencent-style Hunyuan responses.
 """
 
 import asyncio
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from blender_mcp import generation
 from blender_mcp.generation import GenerationError, Job, choose_provider
+
+
+@pytest.fixture(autouse=True)
+def isolate_imported_handles():
+    # Fixtures reuse provider IDs across independent fake Blender sessions.
+    with generation._import_registry_lock:
+        generation._completed_imports.clear()
+    yield
+    with generation._import_registry_lock:
+        generation._completed_imports.clear()
 
 
 class FakeAddon:
@@ -247,3 +260,190 @@ def test_repeating_an_unfinished_request_resumes_instead_of_paying_again(tmp_pat
     assert 'job="tripo:rid:r1"' in first and 'job="tripo:rid:r1"' in second
     assert "resumed" in second
     assert [c for c, _ in send.calls].count("create_tripo_job") == 1
+
+
+def test_concurrent_submit_for_same_path_pays_once(tmp_path):
+    path = tmp_path / "pending.json"
+    # Distinct Pending instances must share the same lock, including paths
+    # that spell the same file differently.
+    first = generation.Pending(path)
+    second = generation.Pending(path.parent / "." / path.name)
+    start = threading.Barrier(2)
+    calls = []
+    job = Job("tripo", "rid", "threaded-submission", "Robot")
+
+    def factory():
+        calls.append(True)
+        return job
+
+    def submit(pending):
+        start.wait(timeout=2)
+        return pending.find_or_submit("same-request", factory)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(submit, first)
+        b = pool.submit(submit, second)
+        results = [a.result(timeout=3), b.result(timeout=3)]
+    assert calls == [True]
+    assert sorted(resumed for _, resumed in results) == [False, True]
+    assert all(result == job for result, _ in results)
+    assert len(json.loads(path.read_text())) == 1
+
+
+def test_concurrent_distinct_pending_adds_are_not_lost(tmp_path):
+    path = tmp_path / "pending.json"
+
+    def add(i):
+        generation.Pending(path).add(str(i), Job("tripo", "rid", str(i), str(i)))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(add, range(20)))
+    assert len(json.loads(path.read_text())) == 20
+    assert all(generation.Pending(path).find(str(i)) is not None for i in range(20))
+
+
+def test_find_or_submit_reuses_synchronous_completed_result(tmp_path):
+    path = tmp_path / "pending.json"
+    calls = []
+
+    def factory():
+        calls.append(True)
+        return "Generated and imported locally"
+
+    assert generation.Pending(path).find_or_submit("local", factory) == ("Generated and imported locally", False)
+    assert generation.Pending(path).find_or_submit("local", factory) == ("Generated and imported locally", True)
+    assert calls == [True]
+    assert generation.Pending(path).find("local") is None, "legacy find returns only asynchronous Jobs"
+
+
+def test_failed_factory_leaves_request_retryable(tmp_path):
+    pending = generation.Pending(tmp_path / "pending.json")
+
+    def fail():
+        raise GenerationError("quota exhausted")
+
+    with pytest.raises(GenerationError, match="quota exhausted"):
+        pending.find_or_submit("request", fail)
+    job = Job("tripo", "rid", "retry", "X")
+    assert pending.find_or_submit("request", lambda: job) == (job, False)
+
+
+def test_atomic_pending_write_keeps_prior_file_and_shared_fallback_on_failure(tmp_path, monkeypatch):
+    path = tmp_path / "pending.json"
+    first = Job("tripo", "rid", "first", "A")
+    second = Job("tripo", "rid", "second", "B")
+    generation.Pending(path).add("first", first)
+    before = path.read_bytes()
+
+    def broken_dump(entries, stream):
+        stream.write("[{\"partial\":")
+        raise OSError("disk full")
+
+    monkeypatch.setattr(generation.json, "dump", broken_dump)
+    result = generation.Pending(path).find_or_submit("second", lambda: second)
+    assert result == (second, False)
+    assert path.read_bytes() == before
+    assert not list(tmp_path.glob("*.tmp"))
+    assert generation.Pending(path).find("first") == first
+    assert generation.Pending(path).find_or_submit("second", lambda: pytest.fail("charged twice")) == (second, True)
+
+
+def test_atomic_pending_write_replaces_only_complete_json(tmp_path, monkeypatch):
+    path = tmp_path / "pending.json"
+    generation.Pending(path).add("one", Job("tripo", "rid", "one", "A"))
+    replace = generation.os.replace
+    seen = []
+
+    def inspect_replace(source, destination):
+        from pathlib import Path
+        old_entries = json.loads(path.read_text())
+        new_entries = json.loads(Path(source).read_text())
+        seen.append((len(old_entries), len(new_entries)))
+        replace(source, destination)
+
+    monkeypatch.setattr(generation.os, "replace", inspect_replace)
+    generation.Pending(path).add("two", Job("tripo", "rid", "two", "B"))
+    assert seen == [(1, 2)]
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_pending_state_cache_is_bounded_without_changing_live_locks(tmp_path, monkeypatch):
+    monkeypatch.setattr(generation, "PENDING_STATE_CACHE_SIZE", 2)
+    first = generation.Pending(tmp_path / "first.json")
+    for i in range(5):
+        generation.Pending(tmp_path / (str(i) + ".json"))
+    assert len(generation._pending_recent) == 2
+    assert generation.Pending(first.path)._state is first._state
+
+
+def test_concurrent_waiters_import_same_job_once_and_reuse_result():
+    calls = []
+    polling = threading.Barrier(2)
+    job = Job("tripo", "rid", "shared-import", "FirstName")
+
+    def send(command, params):
+        calls.append((command, params))
+        if command == "poll_tripo_job_status":
+            polling.wait(timeout=3)
+            return {"status": "COMPLETED"}
+        return {"succeed": True, "objects": ["FirstName"]}
+
+    def wait(name):
+        return asyncio.run(generation.wait_and_import(send, Job.parse(job.handle, name), 10))
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(wait, "FirstName")
+        second = pool.submit(wait, "SecondName")
+        results = [first.result(timeout=5), second.result(timeout=5)]
+    imports = [params for command, params in calls if command == "import_generated_asset_tripo"]
+    assert len(imports) == 1
+    imported_name = imports[0]["name"]
+    assert results == [(True, imported_name), (True, imported_name)]
+    # A later retry skips both polling and import, and returns the name that
+    # was actually imported, rather than renaming or duplicating the object.
+    assert asyncio.run(generation.wait_and_import(lambda *_: pytest.fail("reimported"), job, 1)) == (True, imported_name)
+    assert generation._completed_imports[job.handle].result == {"succeed": True, "objects": ["FirstName"]}
+
+
+@pytest.mark.parametrize("blocking_command", ["poll_tripo_job_status", "import_generated_asset_tripo"])
+def test_generation_poll_and_import_do_not_block_event_loop(blocking_command):
+    started = threading.Event()
+    release = threading.Event()
+    job = Job("tripo", "rid", "responsive-poll", "X")
+
+    def send(command, params):
+        if command == blocking_command:
+            started.set()
+            assert release.wait(timeout=3)
+        if command == "poll_tripo_job_status":
+            return {"status": "COMPLETED"}
+        return {"succeed": True}
+
+    async def run():
+        waiter = asyncio.create_task(generation.wait_and_import(send, job, 10))
+        assert await asyncio.to_thread(started.wait, 2)
+        # This callback must execute while the blocking provider poll is
+        # still waiting in its worker thread.
+        await asyncio.sleep(0)
+        assert not waiter.done()
+        release.set()
+        assert await waiter == (True, "X")
+
+    asyncio.run(run())
+
+
+def test_completed_import_cache_is_bounded_and_failed_import_is_retryable(monkeypatch):
+    monkeypatch.setattr(generation, "COMPLETED_IMPORT_CACHE_SIZE", 2)
+    send = FakeAddon({"poll_tripo_job_status": {"status": "COMPLETED"},
+                      "import_generated_asset_tripo": {"succeed": True}})
+    for i in range(3):
+        _run(send, Job("tripo", "rid", "bounded-" + str(i), "X"))
+    assert len(generation._completed_imports) == 2
+    assert "tripo:rid:bounded-0" not in generation._completed_imports
+    failed_job = Job("tripo", "rid", "retry-import", "Retry")
+    send.replies["import_generated_asset_tripo"] = {"succeed": False, "error": "download failed"}
+    with pytest.raises(GenerationError, match="download failed"):
+        _run(send, failed_job)
+    assert failed_job.handle not in generation._completed_imports
+    send.replies["import_generated_asset_tripo"] = {"succeed": True}
+    assert _run(send, failed_job) == (True, "Retry")

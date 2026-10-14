@@ -148,7 +148,9 @@ def test_pypi_handover_points_clients_on_this_fork_at_its_setup(pypi, monkeypatc
     out = capsys.readouterr().out
     assert f"Not running the server from PyPI yet: Cursor (runs mcp-for-blender from {GIT_SOURCE})" in out
     # Upstream's setup can't move entries off this fork; this fork's can, told to use PyPI.
-    assert f"`BLENDER_MCP_SOURCE=pypi uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out
+    command = f"uvx --from {GIT_SOURCE} mcp-for-blender setup"
+    assert (f"`BLENDER_MCP_SOURCE=pypi {command}`" in out or
+            f'`$env:BLENDER_MCP_SOURCE="pypi"; {command}`' in out)
 
 
 def test_uv_tool_install_is_upgraded_first(pypi, monkeypatch):
@@ -172,7 +174,9 @@ def test_without_uvx_latest_release_updates_addon(pypi, monkeypatch, capsys):
     assert "Server source: PyPI" in out
     assert "2.1.0, the latest release" in out
     # Addon not installed → points at setup, carrying the source.
-    assert f"`BLENDER_MCP_SOURCE=pypi uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out
+    command = f"uvx --from {GIT_SOURCE} mcp-for-blender setup"
+    assert (f"`BLENDER_MCP_SOURCE=pypi {command}`" in out or
+            f'`$env:BLENDER_MCP_SOURCE="pypi"; {command}`' in out)
 
 
 def test_rerun_does_not_check_pypi_again(pypi, monkeypatch, capsys):

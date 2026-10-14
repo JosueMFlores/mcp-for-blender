@@ -16,7 +16,11 @@ import json
 import logging
 import os
 import re
+import tempfile
+import threading
 import time
+import weakref
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
@@ -41,6 +45,8 @@ MAX_CALL_S = 45.0
 # Unfinished jobs older than this are dropped from the pending file: the
 # Premium sweeper fails jobs after 60 minutes, and provider results expire.
 PENDING_MAX_AGE_S = 2 * 3600
+PENDING_STATE_CACHE_SIZE = 128
+COMPLETED_IMPORT_CACHE_SIZE = 256
 
 TRIPO_UNAVAILABLE = ("Tripo is only available with MCP for Blender Premium. If Premium is on, update the Blender "
                      f"addon: run `{uvx_command('install-addon')}`, then restart Blender.")
@@ -88,59 +94,147 @@ def request_key(provider: str, prompt: str | None, image: str | None,
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+class _PendingState:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.fallback: list[dict] = []
+        self.unpersisted = False
+
+
+_pending_registry_lock = threading.Lock()
+_pending_states = weakref.WeakValueDictionary()
+_pending_recent: OrderedDict[str, _PendingState] = OrderedDict()
+
+
+def _pending_state(path: Path | None) -> _PendingState:
+    if path is None:
+        return _PendingState()
+    key = os.path.normcase(str(path.expanduser().resolve()))
+    with _pending_registry_lock:
+        state = _pending_states.get(key)
+        if state is None:
+            state = _PendingState()
+            _pending_states[key] = state
+        # Retain recent fallback data across short-lived Pending instances.
+        # Weak references keep a live instance's lock stable even if its
+        # entry ages out of the bounded recent-state cache.
+        _pending_recent[key] = state
+        _pending_recent.move_to_end(key)
+        while len(_pending_recent) > PENDING_STATE_CACHE_SIZE:
+            _pending_recent.popitem(last=False)
+        return state
+
+
 class Pending:
     """Generations submitted but not yet imported or failed, kept on disk.
 
     A client timeout or a restart loses the job handle from the conversation,
     and the usual next step is the same request again, which pays twice. With
-    the job written down here, that retry resumes it instead. Never raises:
-    a missing or unreadable file just means nothing is pending.
+    the job written down here, that retry resumes it instead. Persistence is
+    best-effort; submission errors still propagate to the caller.
     """
 
     def __init__(self, path: Path | None, clock: Callable[[], float] = time.time):
-        self.path = path
+        self.path = path.expanduser().resolve() if path is not None else None
         self.clock = clock
+        self._state = _pending_state(self.path)
 
     def _load(self) -> list[dict]:
-        if not self.path:
-            return []
-        try:
-            entries = json.loads(self.path.read_text(encoding="utf-8"))
-        except Exception:
-            return []
+        if not self.path or self._state.unpersisted:
+            entries = self._state.fallback
+        else:
+            try:
+                entries = json.loads(self.path.read_text(encoding="utf-8"))
+            except Exception:
+                entries = self._state.fallback
         if not isinstance(entries, list):
-            return []
+            entries = []
         oldest = self.clock() - PENDING_MAX_AGE_S
-        return [e for e in entries if isinstance(e, dict) and e.get("started_at", 0) >= oldest]
+        return [e for e in entries if isinstance(e, dict)
+                and isinstance(e.get("started_at"), (int, float))
+                and e["started_at"] >= oldest]
 
     def _save(self, entries: list[dict]) -> None:
+        self._state.fallback = entries
+        self._state.unpersisted = True
         if not self.path:
             return
+        temporary = None
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            self.path.write_text(json.dumps(entries), encoding="utf-8")
+            # Readers in another process see either complete version, never
+            # an empty or half-written JSON document.
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                                             dir=self.path.parent, prefix=self.path.name + ".",
+                                             suffix=".tmp", delete=False) as stream:
+                temporary = stream.name
+                json.dump(entries, stream)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, self.path)
+            temporary = None
+            self._state.unpersisted = False
         except Exception as e:
             logger.debug(f"Pending generations write failed: {e}")
+        finally:
+            if temporary:
+                try:
+                    os.unlink(temporary)
+                except OSError:
+                    pass
 
-    def find(self, key: str) -> Job | None:
+    def _find(self, key: str) -> Job | str | None:
         for entry in self._load():
             if entry.get("key") == key:
+                if isinstance(entry.get("result"), str):
+                    return entry["result"]
                 try:
                     return Job.parse(entry["handle"], entry.get("name") or "Generated")
                 except (GenerationError, KeyError):
                     return None
         return None
 
+    def find(self, key: str) -> Job | None:
+        with self._state.lock:
+            result = self._find(key)
+            return result if isinstance(result, Job) else None
+
+    def find_or_submit(self, key: str, factory: Callable[[], Job | str]) -> tuple[Job | str, bool]:
+        """Reuse a request or submit it once while holding its file's lock.
+
+        The synchronous factory may perform a paid network request. Async
+        callers should call this method via asyncio.to_thread.
+        """
+        with self._state.lock:
+            existing = self._find(key)
+            if existing is not None:
+                return existing, True
+            submitted = factory()
+            if isinstance(submitted, Job):
+                self.add(key, submitted)
+            elif isinstance(submitted, str):
+                # LOCAL_API can finish and import during submission itself.
+                # Remember its result too, so a concurrent retry cannot pay
+                # again just because there is no asynchronous job handle.
+                entries = [e for e in self._load() if e.get("key") != key]
+                entries.append({"key": key, "result": submitted, "started_at": self.clock()})
+                self._save(entries)
+            else:
+                raise TypeError("Generation submission must return a Job or a completed message")
+            return submitted, False
+
     def add(self, key: str, job: Job) -> None:
-        entries = [e for e in self._load() if e.get("handle") != job.handle]
-        entries.append({"key": key, "handle": job.handle, "name": job.name, "started_at": self.clock()})
-        self._save(entries)
+        with self._state.lock:
+            entries = [e for e in self._load() if e.get("handle") != job.handle and e.get("key") != key]
+            entries.append({"key": key, "handle": job.handle, "name": job.name, "started_at": self.clock()})
+            self._save(entries)
 
     def remove(self, job: Job) -> None:
-        entries = self._load()
-        kept = [e for e in entries if e.get("handle") != job.handle]
-        if len(kept) != len(entries):
-            self._save(kept)
+        with self._state.lock:
+            entries = self._load()
+            kept = [e for e in entries if e.get("handle") != job.handle]
+            if len(kept) != len(entries):
+                self._save(kept)
 
 
 def _relay(result: Any) -> None:
@@ -310,6 +404,52 @@ def import_result(send: Send, job: Job, detail: Any) -> Any:
     return result
 
 
+class _ImportGuard:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.completed = None
+
+
+@dataclass
+class _CompletedImport:
+    name: str
+    result: Any
+
+
+_import_registry_lock = threading.Lock()
+_import_guards = weakref.WeakValueDictionary()
+_completed_imports: OrderedDict[str, _CompletedImport] = OrderedDict()
+
+
+def _completed_import(job: Job) -> _CompletedImport | None:
+    with _import_registry_lock:
+        result = _completed_imports.get(job.handle)
+        if result is not None:
+            _completed_imports.move_to_end(job.handle)
+        return result
+
+
+def _import_once(send: Send, job: Job, detail: Any) -> _CompletedImport:
+    """Serialize only importing one handle; polling remains independent."""
+    with _import_registry_lock:
+        guard = _import_guards.get(job.handle)
+        if guard is None:
+            guard = _ImportGuard()
+            _import_guards[job.handle] = guard
+    with guard.lock:
+        completed = guard.completed or _completed_import(job)
+        if completed is not None:
+            return completed
+        completed = _CompletedImport(job.name, import_result(send, job, detail))
+        guard.completed = completed
+        with _import_registry_lock:
+            _completed_imports[job.handle] = completed
+            _completed_imports.move_to_end(job.handle)
+            while len(_completed_imports) > COMPLETED_IMPORT_CACHE_SIZE:
+                _completed_imports.popitem(last=False)
+        return completed
+
+
 async def wait_and_import(send: Send, job: Job, wait_seconds: float,
                           progress: Progress | None = None,
                           sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -322,21 +462,38 @@ async def wait_and_import(send: Send, job: Job, wait_seconds: float,
     """
     start = clock()
     while True:
+        completed = _completed_import(job)
+        if completed is not None:
+            if pending:
+                await asyncio.to_thread(pending.remove, job)
+            return True, completed.name
         try:
-            state, detail = poll(send, job)
+            state, detail = await asyncio.to_thread(poll, send, job)
             if state == "done":
-                import_result(send, job, detail)
+                completed = await asyncio.to_thread(_import_once, send, job, detail)
         except Unsupported:
             raise
         except Exception as e:
+            # Another waiter may have imported the same handle while this
+            # caller was receiving a stale or failed polling response.
+            completed = _completed_import(job)
+            if completed is not None:
+                if pending:
+                    await asyncio.to_thread(pending.remove, job)
+                return True, completed.name
             raise GenerationError(f"{e}. The generation may still be running or finished. {job.resume_hint}") from e
         if state == "done":
             if pending:
-                pending.remove(job)
-            return True, job.name
+                await asyncio.to_thread(pending.remove, job)
+            return True, completed.name
+        completed = _completed_import(job)
+        if completed is not None:
+            if pending:
+                await asyncio.to_thread(pending.remove, job)
+            return True, completed.name
         if state == "failed":
             if pending:
-                pending.remove(job)
+                await asyncio.to_thread(pending.remove, job)
             raise GenerationError(f"Generation failed: {str(detail).rstrip('.')}. This attempt was not imported.")
         elapsed = clock() - start
         if elapsed + POLL_INTERVAL_S > wait_seconds:

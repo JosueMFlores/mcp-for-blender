@@ -11,6 +11,7 @@ MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
     "export_scene", "get_guide",
+    "checkpoint_scene", "run_recipe", "run_operation", "operation_status",
 }
 
 

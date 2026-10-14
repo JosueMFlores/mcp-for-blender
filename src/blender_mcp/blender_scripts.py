@@ -21,10 +21,10 @@ def build(script: str, args: dict) -> str:
     body = "\n".join("    " + line if line.strip() else "" for line in script.strip("\n").splitlines())
     # json.loads of a Python string literal, since JSON's true/null aren't Python.
     return (
-        "import json as _json\n"
-        f"ARGS = _json.loads({json.dumps(json.dumps(args))})\n"
+        "from json import loads as _json_loads, dumps as _json_dumps\n"
+        f"ARGS = _json_loads({json.dumps(json.dumps(args))})\n"
         f"def _main():\n{body}\n"
-        f"print({RESULT_MARKER!r} + _json.dumps(_main()))\n"
+        f"print({RESULT_MARKER!r} + _json_dumps(_main()))\n"
     )
 
 

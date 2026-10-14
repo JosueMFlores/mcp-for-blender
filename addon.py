@@ -39,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 14
+ADDON_PROTOCOL_VERSION = 15
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -1603,7 +1603,7 @@ class BlenderMCPServer:
         client.settimeout(1.0)
         with self._clients_lock:
             self._clients.add(client)
-        buffer = b''
+        buffer = bytearray()
 
         try:
             while self.running:
@@ -1614,11 +1614,17 @@ class BlenderMCPServer:
                         print("Client disconnected")
                         break
 
-                    buffer += data
+                    buffer.extend(data)
+                    if len(buffer) > 180 * 1024 * 1024:
+                        raise ValueError("MCP command exceeds the 180 MiB message limit")
+                    # Large local models are base64 inside a JSON object. Avoid
+                    # decoding/reparsing its entire prefix for each 8 KiB chunk.
+                    if not data.rstrip().endswith(b'}'):
+                        continue
                     try:
                         # Try to parse command
                         command = json.loads(buffer.decode('utf-8'))
-                        buffer = b''
+                        buffer.clear()
 
                         # Hand off to the main thread. Never call
                         # bpy.app.timers.register() from here - it is not
@@ -1683,6 +1689,11 @@ class BlenderMCPServer:
             "get_viewport_screenshot": self.get_viewport_screenshot,
             "pick_viewport_object": self.pick_viewport_object,
             "execute_code": self.execute_code,
+            "create_checkpoint": self.create_checkpoint,
+            "list_checkpoints": self.list_checkpoints,
+            "restore_checkpoint": self.restore_checkpoint,
+            "get_hunyuan3d_local_config": self.get_hunyuan3d_local_config,
+            "import_local_hunyuan": self.import_local_hunyuan,
             "describe_node_type": self.describe_node_type,
             "bpy_api_lookup": self.bpy_api_lookup,
             "drain_human_activity": self.drain_human_activity,
@@ -1777,6 +1788,11 @@ class BlenderMCPServer:
                 "get_viewport_screenshot",
                 "pick_viewport_object",
                 "execute_code",
+                "create_checkpoint",
+                "list_checkpoints",
+                "restore_checkpoint",
+                "get_hunyuan3d_local_config",
+                "import_local_hunyuan",
                 "describe_node_type",
                 "bpy_api_lookup",
                 "drain_human_activity",
@@ -2411,10 +2427,179 @@ class BlenderMCPServer:
             "location": list(picked.matrix_world.translation),
         }}
 
-    def execute_code(self, code):
-        """Execute arbitrary Blender Python code"""
-        # This is powerful but potentially dangerous - use with caution
+    # Session-scoped storage survives opening a .blend and server reconnects.
+    # It deliberately lives outside bpy.data, which is replaced on restore.
+    _checkpoint_store = None
+
+    @staticmethod
+    def _checkpoint_main_thread():
+        import threading
+
+        if threading.current_thread() is not threading.main_thread():
+            raise RuntimeError("Recovery checkpoints must run on Blender's main thread")
+
+    def _get_checkpoint_store(self):
+        import tempfile
+
+        store = type(self)._checkpoint_store
+        if store is None:
+            store = {
+                "directory": tempfile.mkdtemp(prefix="blendermcp-checkpoints-"),
+                "entries": [],
+            }
+            type(self)._checkpoint_store = store
+        return store
+
+    def _checkpoint_path(self, checkpoint_id):
+        """Resolve only our opaque IDs, never a caller-provided file path."""
+        import os
+        import re
+
+        if not isinstance(checkpoint_id, str) or not re.fullmatch(r"[0-9a-f]{32}", checkpoint_id):
+            raise ValueError("Invalid checkpoint ID; use list_checkpoints to obtain an ID")
+        directory = self._get_checkpoint_store()["directory"]
+        path = os.path.join(directory, checkpoint_id + ".blend")
+        if os.path.islink(directory) or os.path.islink(path):
+            raise ValueError("Checkpoint storage must not contain symbolic links")
+        if os.path.dirname(os.path.realpath(path)) != os.path.realpath(directory):
+            raise ValueError("Checkpoint is outside this recovery session")
+        return path
+
+    def _write_checkpoint_index(self, entries):
+        import json
+        import os
+
+        directory = self._get_checkpoint_store()["directory"]
+        destination = os.path.join(directory, "index.json")
+        temporary = destination + ".tmp"
+        if os.path.islink(destination) or os.path.islink(temporary):
+            raise ValueError("Checkpoint index must not be a symbolic link")
+        with open(temporary, "w", encoding="utf-8") as stream:
+            json.dump({"version": 1, "checkpoints": entries}, stream, ensure_ascii=False)
+        os.replace(temporary, destination)
+
+    def _create_checkpoint(self, label, protected_id=None):
+        import os
+        import uuid
+        from datetime import datetime, timezone
+
+        self._checkpoint_main_thread()
+        if not isinstance(label, str) or len(label) > 200:
+            raise ValueError("Checkpoint label must be a string of at most 200 characters")
+        store = self._get_checkpoint_store()
+        checkpoint_id = uuid.uuid4().hex
+        path = self._checkpoint_path(checkpoint_id)
+        original_filepath = bpy.data.filepath
+
+        # Flush live mesh edits without changing the user's mode. Failing to
+        # capture them would make the apparent recovery point misleading.
+        for obj in getattr(bpy.context, "objects_in_mode", ()):
+            if getattr(obj, "mode", "OBJECT") == 'EDIT':
+                flush = getattr(obj, "update_from_editmode", None)
+                if flush is None:
+                    raise RuntimeError("Cannot capture edit mode for this object; switch to Object Mode first")
+                flush()
+
         try:
+            outcome = bpy.ops.wm.save_as_mainfile(
+                filepath=path, check_existing=False, copy=True, relative_remap=True,
+            )
+            if 'FINISHED' not in outcome or not os.path.isfile(path) or os.path.getsize(path) == 0:
+                raise RuntimeError("Blender did not finish writing the recovery checkpoint")
+            entry = {
+                "checkpoint_id": checkpoint_id,
+                "label": label,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "original_filepath": original_filepath,
+                "bytes": os.path.getsize(path),
+            }
+            retained = store["entries"] + [entry]
+            expired = []
+            while len(retained) > 10:
+                index = next(i for i, item in enumerate(retained)
+                             if item["checkpoint_id"] != protected_id)
+                expired.append(retained.pop(index))
+            self._write_checkpoint_index(retained)
+            store["entries"] = retained
+        except Exception:
+            # Delete only this freshly generated, validated session filename.
+            if os.path.isfile(path) and not os.path.islink(path):
+                try:
+                    os.unlink(path)
+                except OSError:
+                    pass
+            raise
+
+        warnings = []
+        for item in expired:
+            try:
+                expired_path = self._checkpoint_path(item["checkpoint_id"])
+                if os.path.isfile(expired_path):
+                    os.unlink(expired_path)
+            except (OSError, ValueError) as exc:
+                warnings.append("Could not remove expired checkpoint %s: %s" %
+                                (item["checkpoint_id"], exc))
+        result = dict(entry)
+        if warnings:
+            result["warnings"] = warnings
+        return result
+
+    def create_checkpoint(self, label=""):
+        """Save a separate .blend copy without overwriting the user's project."""
+        return self._create_checkpoint(label)
+
+    def list_checkpoints(self):
+        """List at most ten recovery points belonging to this add-on session."""
+        self._checkpoint_main_thread()
+        store = self._get_checkpoint_store()
+        return {"checkpoints": [dict(item) for item in store["entries"]], "limit": 10}
+
+    def restore_checkpoint(self, checkpoint_id):
+        """Open a recovery copy, first preserving the current scene separately."""
+        import json
+        import os
+        import traceback
+
+        self._checkpoint_main_thread()
+        path = self._checkpoint_path(checkpoint_id)
+        store = self._get_checkpoint_store()
+        entry = next((item for item in store["entries"]
+                      if item["checkpoint_id"] == checkpoint_id), None)
+        if entry is None or not os.path.isfile(path):
+            raise ValueError("Checkpoint not found in this recovery session")
+
+        # Pin the target during pruning: restoring the oldest of ten entries
+        # must not delete it when its safety checkpoint is created.
+        safety = self._create_checkpoint("Before restoring " + checkpoint_id, protected_id=checkpoint_id)
+        try:
+            outcome = bpy.ops.wm.open_mainfile(filepath=path, load_ui=False, use_scripts=False)
+            if 'FINISHED' not in outcome:
+                raise RuntimeError("Blender did not finish opening the recovery checkpoint")
+        except Exception as exc:
+            raise RuntimeError(json.dumps({
+                "exception_type": type(exc).__name__, "message": str(exc),
+                "traceback": traceback.format_exc(), "checkpoint_id": checkpoint_id,
+                "safety_checkpoint_id": safety["checkpoint_id"],
+            })) from exc
+
+        return {
+            "restored": True,
+            "checkpoint_id": checkpoint_id,
+            "safety_checkpoint_id": safety["checkpoint_id"],
+            "original_filepath": entry["original_filepath"],
+            "restored_filepath": bpy.data.filepath,
+            "message": "Opened the recovery copy while keeping the current UI. Use Save As to choose a project destination; the original project file was not overwritten.",
+        }
+
+    def execute_code(self, code, checkpoint=False):
+        """Execute Blender Python, optionally saving a manual recovery point."""
+        # This is powerful but potentially dangerous - use with caution
+        checkpoint_id = None
+        try:
+            if not isinstance(checkpoint, bool):
+                raise ValueError("checkpoint must be a boolean")
+            if checkpoint:
+                checkpoint_id = self.create_checkpoint("Before execute_code")["checkpoint_id"]
             # Create a local namespace for execution
             namespace = {"bpy": bpy}
 
@@ -2424,20 +2609,27 @@ class BlenderMCPServer:
                 exec(code, namespace)
 
             captured_output = capture_buffer.getvalue()
-            return {"executed": True, "result": captured_output}
+            result = {"executed": True, "result": captured_output}
+            if checkpoint_id:
+                result["checkpoint_id"] = checkpoint_id
+            return result
         except Exception as e:
             # Give the caller the same detail we have: exception type, message,
             # and a full traceback (with line numbers into the submitted code),
             # instead of collapsing everything into one string. Callers that ran
             # a multi-line script otherwise cannot tell which line failed.
             tb = traceback.format_exc()
-            raise Exception(
-                json.dumps({
+            error = {
                     "exception_type": type(e).__name__,
                     "message": str(e),
                     "traceback": tb,
-                })
-            )
+            }
+            if checkpoint_id:
+                error["checkpoint_id"] = checkpoint_id
+                error["checkpoint"] = checkpoint_id
+            elif checkpoint:
+                error["stage"] = "checkpoint"
+            raise Exception(json.dumps(error)) from e
 
     # ------------------------------------------------------------------
     # Documentation / introspection helpers.
@@ -4942,6 +5134,47 @@ class BlenderMCPServer:
         }
 
         return headers, endpoint
+
+    def get_hunyuan3d_local_config(self):
+        """Only JSON settings; HTTP generation runs in the MCP process, never in bpy's thread."""
+        scene = bpy.context.scene
+        if premium_active() or not getattr(scene, "blendermcp_use_hunyuan3d", False) or \
+                getattr(scene, "blendermcp_hunyuan3d_mode", "") != "LOCAL_API":
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "base_url": self._get_hunyuan3d_api_url().rstrip('/'),
+            "settings": {key: getattr(scene, "blendermcp_hunyuan3d_" + key) for key in
+                         ("octree_resolution", "num_inference_steps", "guidance_scale", "texture")},
+        }
+
+    def import_local_hunyuan(self, glb_base64, name="Generated"):
+        """Import the completed local job. The MCP process has already done the HTTP work."""
+        if not isinstance(glb_base64, str) or len(glb_base64) > 180 * 1024 * 1024:
+            raise ValueError("Local Hunyuan model is missing or too large (128 MiB maximum)")
+        raw = base64.b64decode(glb_base64, validate=True)
+        if len(raw) > 128 * 1024 * 1024 or raw[:4] != b'glTF':
+            raise ValueError("Local Hunyuan returned an invalid GLB or a model over 128 MiB")
+        with tempfile.TemporaryDirectory(prefix="blendermcp-local-") as directory:
+            path = osp.join(directory, "model.glb")
+            with open(path, "wb") as stream:
+                stream.write(raw)
+            before = set(bpy.data.objects)
+            bpy.ops.import_scene.gltf(filepath=path)
+            imported = [obj for obj in bpy.data.objects if obj not in before]
+            meshes = [obj for obj in imported if obj.type == 'MESH']
+            if not meshes:
+                raise ValueError("Local Hunyuan model contained no mesh")
+            meshes[0].name = name or "Generated"
+            # Imported images must survive deletion of the temporary source.
+            for obj in meshes:
+                for slot in obj.material_slots:
+                    tree = getattr(slot.material, "node_tree", None)
+                    for node in tree.nodes if tree else ():
+                        if node.type == 'TEX_IMAGE' and node.image and not node.image.packed_file:
+                            node.image.pack()
+            return {"succeed": True, "name": meshes[0].name,
+                    "imported": [obj.name for obj in imported]}
 
     def create_hunyuan_job(self, *args, quality=None, **kwargs):
         # quality is Premium-only; your own Tencent key has no such option.

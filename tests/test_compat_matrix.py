@@ -160,7 +160,7 @@ class HistoricalAddon:
     def _execute(self, code):
         if not self.returns_output:
             return {"executed": True}
-        literal = re.search(r"^ARGS = _json\.loads\((.*)\)$", code, re.M)
+        literal = re.search(r"^ARGS = (?:_json\.loads|_json_loads|_recipe_loads)\((.*)\)$", code, re.M)
         if not literal:
             return {"executed": True, "result": ""}
         args = json.loads(json.loads(literal.group(1)))

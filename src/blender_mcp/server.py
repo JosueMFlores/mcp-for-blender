@@ -14,6 +14,8 @@ import sys
 import time
 import base64
 import re
+import asyncio
+from contextvars import ContextVar
 
 # Import telemetry
 from .telemetry import record_startup, get_telemetry, is_telemetry_enabled, EventType
@@ -57,6 +59,9 @@ logger = logging.getLogger("BlenderMCPServer")
 # Default configuration
 DEFAULT_HOST = "localhost"
 DEFAULT_PORT = 9876
+# A background operation can spend minutes in a Blender operator. This deadline
+# belongs to its worker context; normal calls keep their existing short timeout.
+COMMAND_TIMEOUT = ContextVar("blender_command_timeout", default=180.0)
 
 
 def parse_connection_args(argv):
@@ -104,6 +109,7 @@ CLI_PORT = None
 _addon_handshake = None
 _addon_handshake_checked = False
 _addon_handshake_lock = threading.Lock()
+_connection_creation_lock = threading.RLock()
 
 @dataclass
 class BlenderConnection:
@@ -122,12 +128,13 @@ class BlenderConnection:
             
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self.sock.settimeout(10.0)
             self.sock.connect((self.host, self.port))
             logger.info(f"Connected to Blender at {self.host}:{self.port}")
             return True
         except Exception as e:
             logger.error(f"Failed to connect to Blender: {str(e)}")
-            self.sock = None
+            self.disconnect()
             return False
     
     def disconnect(self):
@@ -143,12 +150,16 @@ class BlenderConnection:
     def receive_full_response(self, sock, buffer_size=8192):
         """Receive the complete response, potentially in multiple chunks"""
         chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(180.0)  # Match the addon's timeout
+        # Bound the whole response, including a peer that trickles partial data.
+        deadline = time.monotonic() + COMMAND_TIMEOUT.get()
         
         try:
             while True:
                 try:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise socket.timeout("Blender command deadline exceeded")
+                    sock.settimeout(remaining)
                     chunk = sock.recv(buffer_size)
                     if not chunk:
                         # If we get an empty chunk, the connection might be closed
@@ -157,6 +168,8 @@ class BlenderConnection:
                         break
                     
                     chunks.append(chunk)
+                    if not chunk.rstrip().endswith(b'}'):
+                        continue
                     
                     # Check if we've received a complete JSON object
                     try:
@@ -165,7 +178,7 @@ class BlenderConnection:
                         # If we get here, it parsed successfully
                         logger.info(f"Received complete response ({len(data)} bytes)")
                         return data
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, UnicodeDecodeError):
                         # Incomplete JSON, continue receiving
                         continue
                 except socket.timeout:
@@ -224,14 +237,14 @@ class BlenderConnection:
 
         try:
             # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
+            logger.info("Sending command %s (parameter names: %s)", command_type, sorted((params or {}).keys()))
             
             # Send the command
             self.sock.sendall(json.dumps(command).encode('utf-8'))
             logger.info(f"Command sent, waiting for response...")
             
             # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(180.0)  # Match the addon's timeout
+            self.sock.settimeout(COMMAND_TIMEOUT.get())
             
             # Receive the response using the improved receive_full_response method
             response_data = self.receive_full_response(self.sock)
@@ -249,11 +262,11 @@ class BlenderConnection:
             logger.error("Socket timeout while waiting for response from Blender")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
             # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
+            self.disconnect()
             raise Exception("Timeout waiting for Blender response - try simplifying your request. If Blender is running headless (blender -b), commands never execute; run Blender with a GUI or via 'xvfb-run -a blender' instead")
         except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
             logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Connection to Blender lost: {str(e)}")
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON response from Blender: {str(e)}")
@@ -264,7 +277,7 @@ class BlenderConnection:
         except Exception as e:
             logger.error(f"Error communicating with Blender: {str(e)}")
             # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
+            self.disconnect()
             raise Exception(f"Communication error with Blender: {str(e)}")
 
 @asynccontextmanager
@@ -306,6 +319,9 @@ async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
         # Return an empty context - we're using the global connection
         yield {}
     finally:
+        from . import workflows
+        if workflows._manager is not None:
+            workflows._manager.close()
         try:
             from .trajectory import get_trajectory_recorder
 
@@ -333,6 +349,10 @@ with the full bpy API, so anything Blender can do, you can do; look shows you th
 Start with get_addon_status (Blender version, which libraries and generators are on) and
 get_scene_info. Before rigging, animation, retopology, materials, level design or Roblox work,
 load the matching guide with get_guide. export_scene hands models to game engines.
+
+Use checkpoint_scene before large edits, or execute_blender_code(checkpoint=True).
+run_recipe lists reusable workflows. For long code, renders, imports or generations use
+run_operation; keep its id and query operation_status instead of submitting again.
 
 Scripts run in someone else's Blender:
 - Look shader nodes up by type, never by name (names are localized):
@@ -403,8 +423,17 @@ def _addon_protocol() -> int | None:
 
 
 def get_blender_connection():
+    from . import workflows
+    workflows.check_session_active()
+    with _connection_creation_lock:
+        return _get_blender_connection_locked()
+
+
+def _get_blender_connection_locked():
     """Get or create a persistent Blender connection"""
     global _blender_connection
+    from . import workflows
+    workflows.check_session_active()
 
     # Reuse the existing connection. We deliberately do NOT probe it with a
     # command here: that put two commands on the wire for every tool call, and
@@ -467,11 +496,11 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
     null if Blender could not be reached. Use them to answer telemetry status questions.
     """
     try:
-        blender = get_blender_connection()
+        blender = await asyncio.to_thread(get_blender_connection)
         global _addon_handshake, _addon_handshake_checked
         with _addon_handshake_lock:
             _addon_handshake_checked = False
-        _maybe_handshake_addon(blender)
+        await asyncio.to_thread(_maybe_handshake_addon, blender)
         result = _addon_handshake
         if result is None:
             return "Could not determine addon status." + await maybe_prompt_for_consent(ctx)
@@ -483,11 +512,11 @@ async def get_addon_status(ctx: Context, user_prompt: str = "") -> str:
             "capabilities": result.capabilities,
             "blender_version": result.blender_version,
             "premium_generators": result.premium_generators,
-            **_integrations(blender, result.premium_generators),
+            **(await asyncio.to_thread(_integrations, blender, result.premium_generators)),
             "source": result.source,
             "warning": result.warning,
             "telemetry_enabled": is_telemetry_enabled(),
-            "telemetry_consent": get_telemetry().check_user_consent(),
+            "telemetry_consent": await asyncio.to_thread(get_telemetry().check_user_consent),
             "update_command": uvx_command("install-addon"),
             "after_install": (
                 "If the addon file was updated: in Blender, Preferences → Add-ons → "
@@ -655,7 +684,7 @@ async def get_scene_info(
     data = None
     try:
         try:
-            data = _run_script(blender_scripts.SCENE_SUMMARY,
+            data = await asyncio.to_thread(_run_script, blender_scripts.SCENE_SUMMARY,
                                {"query": query, "root": root, "limit": limit, "fields": fields})
         except Exception as e:
             # Very old addons, or a Blender that can't run the script: the
@@ -797,7 +826,7 @@ def _viewport_screenshot(ctx: Context, max_size: int = 1000, user_prompt: str = 
 
 @mcp.tool()
 @trajectory_tool("execute_blender_code", capture_code=True)
-async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -> str:
+async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "", checkpoint: bool = False) -> str:
     """
     Run Python in the user's live Blender (bpy, bmesh, mathutils). Whatever it prints is returned.
 
@@ -805,6 +834,8 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -
 
     Parameters:
     - code: The Python code to execute
+    - checkpoint: Save a recovery copy first (requires addon protocol 15). If the script fails,
+      use checkpoint_scene(action="restore", checkpoint_id=...) to recover. No automatic rollback.
     - user_prompt: The user's own words describing what they want, quoted verbatim (do not paraphrase or summarise). Pass the same goal on every call in a multi-step task so each action is linked to the intent behind it. Never substitute your own sub-goal, plan step, or status text; if the user has given no new instruction, repeat their previous words unchanged.
     """
     if safe_mode_enabled():
@@ -824,19 +855,122 @@ async def execute_blender_code(ctx: Context, code: str, user_prompt: str = "") -
             )
     try:
         # Get the global connection
-        blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
+        def execute():
+            blender = get_blender_connection()
+            if checkpoint and (_addon_protocol() or 0) < 15:
+                raise AddonTooOld(missing_feature("recovery checkpoints"))
+            params = {"code": code}
+            if checkpoint:
+                params["checkpoint"] = True
+            return blender.send_command("execute_code", params)
+        result = await asyncio.to_thread(execute)
+        recovery = f"\nRecovery checkpoint: {result['checkpoint_id']}" if result.get("checkpoint_id") else ""
+        return f"Code executed successfully: {result.get('result', '')}{recovery}"
     except Exception as e:
         logger.error(f"Error executing code: {str(e)}")
         # The addon reports failures as a JSON payload so the traceback survives
         # the socket hop; render it as text rather than echoing the raw blob.
         try:
-            detail = json.loads(str(e))
+            detail = json.loads(str(e).split("Communication error with Blender: ", 1)[-1])
             traceback_text = detail["traceback"]
         except (ValueError, KeyError, TypeError):
             return f"Error executing code: {str(e)}"
-        return f"Error executing code: {detail.get('exception_type', 'Error')}: {detail.get('message', '')}\n\n{traceback_text}"
+        recovery = f"\nRecovery checkpoint: {detail['checkpoint_id']}" if detail.get("checkpoint_id") else ""
+        return f"Error executing code: {detail.get('exception_type', 'Error')}: {detail.get('message', '')}\n\n{traceback_text}{recovery}"
+
+
+@mcp.tool()
+async def checkpoint_scene(ctx: Context, action: str = "create", checkpoint_id: str | None = None,
+                           label: str = "") -> dict:
+    """Create, list or restore a recovery copy of the entire Blender file (addon protocol 15).
+
+    action: create (default), list, restore. Restore requires the returned checkpoint_id and
+    saves a safety copy first. It opens the recovery file with scripts disabled; the original
+    project is untouched. Use Save As to choose where subsequent edits should be saved.
+    Up to ten copies are retained for this Blender session. Restoring during a background
+    operation is refused. This does not undo external files written by arbitrary Python.
+    """
+    from . import workflows
+    try:
+        return await asyncio.to_thread(workflows.checkpoint_scene, action, checkpoint_id, label)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+async def run_recipe(ctx: Context, name: str | None = None, object_names: list[str] | None = None,
+                     options: dict | None = None, checkpoint: bool = True, user_prompt: str = "") -> dict:
+    """List reusable workflows, or run one on explicitly named objects.
+
+    Omit name to see each recipe's options. Recipes: prepare_game_asset makes static mesh
+    copies with UVs, optional decimation and triangulation; product_lighting frames objects
+    with a studio camera and area lights; create_variants makes spaced copies. Original
+    geometry is preserved. Game preparation bakes deformation and is unsuitable for keeping
+    an animated rig. A recovery point is saved by default; checkpoint=False opts out.
+    For expensive workflows use run_operation(kind="recipe", arguments={"name":...,
+    "object_names":[...], "options":{...}}) and poll operation_status.
+    """
+    from . import workflows
+    try:
+        return await asyncio.to_thread(workflows.run_recipe, name, object_names, options, checkpoint)
+    except Exception as exc:
+        result = {"error": str(exc)}
+        if getattr(exc, "checkpoint_id", None):
+            result["checkpoint_id"] = exc.checkpoint_id
+        return result
+
+
+@mcp.tool()
+async def run_operation(ctx: Context, kind: str, arguments: dict, request_id: str | None = None,
+                        checkpoint: bool = True, user_prompt: str = "") -> dict:
+    """Queue a long operation and immediately return its id, state and progress.
+
+    kind: code ({"code":"..."}), recipe (run_recipe arguments), render (optional filepath,
+    animation), import_asset (its arguments), generate_3d (its arguments, except wait_seconds).
+    Query operation_status(id=...) for results; never resubmit to poll. One worker serializes
+    these operations, with a bounded queue. Identical requests resume their existing id;
+    use a new explicit request_id for an intentionally repeated operation. Reusing an id
+    for different arguments is rejected. A recovery copy is saved first unless checkpoint=False.
+
+    Local Hunyuan HTTP runs outside Blender. Other synchronous Blender operators can still
+    occupy Blender's UI; their socket wait runs outside the MCP event loop. Progress is by
+    workflow stage, not a fabricated render percentage. Cancelling a running operator requests
+    cancellation but cannot interrupt Python/bpy safely. Restarted jobs become interrupted
+    and are never automatically replayed; inspect Blender before retrying a paid generation.
+    """
+    from . import workflows
+    try:
+        return workflows.run_operation(kind, arguments, request_id, checkpoint, user_prompt)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+async def operation_status(ctx: Context, id: str | None = None, action: str = "get",
+                           wait_seconds: float = 0) -> dict:
+    """Read a background operation without contacting Blender, even when Blender is busy.
+
+    id is returned by run_operation. action: get (default), list, cancel. get can wait up to
+    30 seconds for completion. cancel stops a queued job; running jobs only receive a request
+    and may still finish. The recovery_checkpoint field holds the saved recovery ID.
+    Metadata survives MCP restart; free text results are redacted on disk and flagged on reload.
+    """
+    from . import workflows
+    try:
+        jobs = workflows.manager()
+        if action == "list":
+            return {"operations": jobs.list()}
+        if not id:
+            raise ValueError("id is required for get or cancel")
+        if action == "cancel":
+            return jobs.cancel(id)
+        if action != "get":
+            raise ValueError("action must be get, list or cancel")
+        if wait_seconds:
+            return await asyncio.to_thread(jobs.wait, id, wait_seconds)
+        return jobs.get(id)
+    except Exception as exc:
+        return {"error": str(exc)}
 
 
 def _polyhaven_credit(result):
@@ -905,8 +1039,8 @@ async def _search_polyhaven(
 ) -> str:
     """search_assets(source="polyhaven"): ranked Poly Haven results, with real-world sizes and the picker."""
     try:
-        blender = get_blender_connection()
-        result = blender.send_command("search_polyhaven_assets", {
+        blender = await asyncio.to_thread(get_blender_connection)
+        result = await asyncio.to_thread(blender.send_command, "search_polyhaven_assets", {
             "asset_type": asset_type,
             "category": category,
             "attributes": attributes,
@@ -996,8 +1130,8 @@ async def _download_polyhaven(
 ) -> str:
     """import_asset(source="polyhaven"): download an HDRI, texture or model and say where it came from."""
     try:
-        blender = get_blender_connection()
-        result = blender.send_command("download_polyhaven_asset", {
+        blender = await asyncio.to_thread(get_blender_connection)
+        result = await asyncio.to_thread(blender.send_command, "download_polyhaven_asset", {
             "asset_id": asset_id,
             "asset_type": asset_type,
             "resolution": resolution,
@@ -1042,8 +1176,8 @@ async def _set_texture(
     """Apply a downloaded Poly Haven texture to an object, replacing its materials (import_asset's apply_to)."""
     try:
         # Get the global connection
-        blender = get_blender_connection()
-        result = blender.send_command("set_texture", {
+        blender = await asyncio.to_thread(get_blender_connection)
+        result = await asyncio.to_thread(blender.send_command, "set_texture", {
             "object_name": object_name,
             "texture_id": texture_id
         })
@@ -1109,7 +1243,7 @@ async def _search_sketchfab(
     try:
         blender = get_blender_connection()
         logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
-        result = blender.send_command("search_sketchfab_models", {
+        result = await asyncio.to_thread(blender.send_command, "search_sketchfab_models", {
             "query": query,
             "categories": categories,
             "count": count,
@@ -1185,7 +1319,7 @@ async def _download_sketchfab(
         blender = get_blender_connection()
         logger.info(f"Downloading Sketchfab model: {uid}, target_size={target_size}")
         
-        result = blender.send_command("download_sketchfab_model", {
+        result = await asyncio.to_thread(blender.send_command, "download_sketchfab_model", {
             "uid": uid,
             "normalize_size": True,  # Always normalize
             "target_size": target_size
@@ -1342,7 +1476,7 @@ async def _search_polypizza(
             f"Searching Poly Pizza models with query: {query}, category: {category}, "
             f"licence: {licence}, animated: {animated}, limit: {limit}"
         )
-        result = blender.send_command("search_polypizza_models", {
+        result = await asyncio.to_thread(blender.send_command, "search_polypizza_models", {
             "query": query,
             "category": category_id,
             "licence": licence_id,
@@ -1424,7 +1558,7 @@ async def _download_polypizza(
             f"target_size={target_size}"
         )
 
-        result = blender.send_command("download_polypizza_model", {
+        result = await asyncio.to_thread(blender.send_command, "download_polypizza_model", {
             "model_id": model_id,
             "normalize_size": normalize_size,
             "target_size": target_size
@@ -1639,7 +1773,7 @@ async def look(
     # Each falls back to the other, since old addons may have only one of them.
     first, second = (native, scripted) if mode == "viewport" and not shading else (scripted, native)
     try:
-        return first()
+        return await asyncio.to_thread(first)
     except _LookRefused as e:
         return _app_error(str(e))
     except Exception as e:
@@ -1649,7 +1783,7 @@ async def look(
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't show the image: {reason}{hint}")
     try:
-        result = second()
+        result = await asyncio.to_thread(second)
     except Exception as e:
         hint = f" {ADDON_UPDATE_HINT}" if _addon_outdated() and ADDON_UPDATE_HINT not in reason else ""
         return _app_error(f"Couldn't capture the view: {reason}{hint}")
@@ -1710,7 +1844,7 @@ async def _generation_reply(ctx: Context, job: "generation.Job", wait_seconds: f
         return f"Still generating ({detail}). {job.resume_hint}{note}"
     reply = f"Generated and imported '{job.name}' with {job.provider}."
     try:
-        bounds = _run_script(blender_scripts.BOUNDS, {"names": [job.name]})
+        bounds = await asyncio.to_thread(_run_script, blender_scripts.BOUNDS, {"names": [job.name]})
     except Exception:
         bounds = []
     for b in bounds:
@@ -1769,24 +1903,34 @@ async def generate_3d(
             return await _generation_reply(ctx, generation.Job.parse(job, name or "Generated"), wait_seconds)
         if bool(prompt) == bool(image):
             return "Error: give exactly one of prompt or image."
-        blender = get_blender_connection()
-        premium = _premium_generators(blender)
+        blender = await asyncio.to_thread(get_blender_connection)
+        premium = await asyncio.to_thread(_premium_generators, blender)
+        own_keys = {} if premium else await asyncio.to_thread(_own_key_generators, blender)
         chosen, is_premium = generation.choose_provider(
-            provider, premium, {} if premium else _own_key_generators(blender))
+            provider, premium, own_keys)
+        if chosen == "hunyuan3d" and not is_premium and (_addon_protocol() or 0) >= 15:
+            from . import workflows
+            if await asyncio.to_thread(workflows.local_config):
+                operation = workflows.run_operation("generate_3d", {
+                    "prompt": prompt, "image": image, "name": name, "provider": "hunyuan3d",
+                    "quality": quality, "bbox_condition": bbox_condition,
+                }, user_prompt=user_prompt)
+                return (f"Local Hunyuan generation queued as operation {operation['id']} "
+                        f"({operation['state']}). Query operation_status(id=\"{operation['id']}\") "
+                        "to wait or retrieve the result; do not submit another generation.")
         note = "" if is_premium else premium_hint_once(ctx, {"mode": None})
         pending = _pending_generations()
         key = generation.request_key(chosen, prompt, image, quality, bbox_condition)
-        started = pending.find(key)
-        if started:
-            note = (" This request was already generating from an earlier call, so it resumed that "
-                    "generation instead of starting a new one." + note)
-        else:
-            started = generation.submit(
+        def submit_once():
+            return generation.submit(
                 _generation_send, chosen, name or generation.default_name(prompt), prompt, image, quality,
                 bbox_condition, supports_quality=(_addon_protocol() or 0) >= 11)
-            if isinstance(started, str):
-                return started + note
-            pending.add(key, started)
+        started, resumed = await asyncio.to_thread(pending.find_or_submit, key, submit_once)
+        if resumed:
+            note = (" This request was already generating from an earlier call, so it resumed that "
+                    "generation instead of starting a new one." + note)
+        if isinstance(started, str):
+            return started + note
         # Submitting (an image upload, say) spends the same client timeout as waiting.
         remaining = wait_seconds - (time.monotonic() - call_start)
         return await _generation_reply(ctx, started, remaining, note)
@@ -2029,13 +2173,13 @@ async def export_scene(
     if preset:
         params["preset"] = preset
     try:
-        blender = get_blender_connection()  # connecting runs the handshake read below
+        blender = await asyncio.to_thread(get_blender_connection)
         # Older addons resolve neither // nor ~: the file would go to the filesystem root, or
         # to a folder literally named ~ in Blender's working directory. ~ isn't expanded here
         # because it means the home folder of Blender's machine, which may not be this one.
         if filepath.startswith(("//", "~")) and _addon_handshake is not None and not _addon_handshake.up_to_date:
             return missing_feature("paths starting with // or ~")
-        result = blender.send_command("export_scene", params)
+        result = await asyncio.to_thread(blender.send_command, "export_scene", params)
     except Exception as e:
         if _addon_lacks(e):
             return missing_feature(f"the {preset} export preset" if preset else "export_scene")
