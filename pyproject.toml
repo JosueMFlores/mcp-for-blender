@@ -20,9 +20,18 @@ dependencies = [
 [project.scripts]
 mcp-for-blender = "blender_mcp.server:main"
 
+# Installed by `uv run`/`uv sync` by default; not part of the published package.
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.6"]
+
 [tool.pytest.ini_options]
 python_files = ["test_*.py"]
 testpaths = ["tests"]
+
+# Only what is certainly a bug: syntax errors, invalid comparisons, undefined
+# names. No style rules.
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
 
 [build-system]
 requires = ["setuptools>=77.0", "wheel"]
@@ -35,5 +44,6 @@ package-dir = {"" = "src"}
 blender_mcp = ["bundled/addon.py", "apps/*.html", "guides/*.md"]
 
 [project.urls]
-"Homepage" = "https://github.com/ahujasid/blender-mcp"
-"Bug Tracker" = "https://github.com/ahujasid/blender-mcp/issues"
+"Homepage" = "https://github.com/JosueMFlores/mcp-for-blender"
+"Bug Tracker" = "https://github.com/JosueMFlores/mcp-for-blender/issues"
+"Upstream" = "https://github.com/ahujasid/blender-mcp"
