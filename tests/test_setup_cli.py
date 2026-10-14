@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
-from blender_mcp import setup_cli
-from blender_mcp.distribution import GIT_SOURCE, SOURCE_ENV
+from blender_mcp import distribution, setup_cli
+from blender_mcp.distribution import GIT_SOURCE, REPO_URL, SOURCE_ENV
 from blender_mcp.setup_cli import (
     CONFIGURED,
     NEW,
     OUTDATED,
+    STALE,
     UNREADABLE,
     Client,
     ClientState,
@@ -28,13 +30,45 @@ from blender_mcp.setup_cli import (
 )
 
 UVX = "/abs/bin/uvx"
-# What entries run by default: the server from this fork's repo.
+# The server from this fork's repo, as one-off commands run it.
 FORK_ARGS = ["--from", GIT_SOURCE, "mcp-for-blender"]
+# The commit `git ls-remote` reports, which setup pins client entries to.
+SHA = "1a2b3c4d5e6f" + "0" * 28
+OLD_SHA = "9" * 40
+PINNED = f"{GIT_SOURCE}@{SHA}"
+PINNED_ARGS = ["--from", PINNED, "mcp-for-blender"]
 
 
 @pytest.fixture(autouse=True)
-def default_source(monkeypatch):
+def default_source(monkeypatch, tmp_path):
     monkeypatch.delenv(SOURCE_ENV, raising=False)
+    # Never the real Claude Code or Codex config.
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codex"))
+
+
+@pytest.fixture(autouse=True)
+def ls_remote(monkeypatch):
+    """`git ls-remote` answers SHA without the network; nothing else may run.
+    Returns the commands it was asked."""
+    calls = []
+
+    def run(cmd, **kwargs):
+        assert cmd[:2] == ["git", "ls-remote"], f"unexpected command {cmd}"
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, 0, f"{SHA}\tHEAD\n", "")
+
+    monkeypatch.setattr(distribution.subprocess, "run", run)
+    return calls
+
+
+@pytest.fixture
+def offline(monkeypatch):
+    def run(cmd, **kwargs):
+        return subprocess.CompletedProcess(
+            cmd, 128, "", "fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com\n")
+
+    monkeypatch.setattr(distribution.subprocess, "run", run)
 
 
 @pytest.fixture
@@ -154,8 +188,8 @@ def test_strip_jsonc_keeps_strings():
         "url": "http://x/*y*/", "a": [1]}
 
 
-def _state(*args, command="/x/uvx"):
-    return servers_state({"b": {"command": command, "args": list(args)}})
+def _state(*args, command="/x/uvx", target=None):
+    return servers_state({"b": {"command": command, "args": list(args)}}, target)
 
 
 def test_servers_state():
@@ -209,6 +243,32 @@ def test_custom_source_is_written_and_recognised(monkeypatch, tmp_path):
     assert _state(*FORK_ARGS).status == OUTDATED
 
 
+def test_pinned_entries_run_this_fork():
+    # With no commit to hold them to, any commit of this fork will do.
+    assert _state(*PINNED_ARGS).status == CONFIGURED
+    assert _state("--from", f"{GIT_SOURCE}.git@{OLD_SHA}", "mcp-for-blender").status == CONFIGURED
+    # Once setup has looked one up, only that commit is current.
+    assert _state(*PINNED_ARGS, target=PINNED).status == CONFIGURED
+    state = _state("--from", f"{GIT_SOURCE}@{OLD_SHA}", "mcp-for-blender", target=PINNED)
+    assert (state.status, state.detail) == (STALE, "runs an older commit of this fork")
+    state = _state(*FORK_ARGS, target=PINNED)
+    assert (state.status, state.detail) == (STALE, "runs this fork unpinned, so it can't start offline")
+    # The same commit of another repo is still another source.
+    upstream = f"git+https://github.com/ahujasid/blender-mcp@{SHA}"
+    assert _state("--from", upstream, "mcp-for-blender", target=PINNED).status == OUTDATED
+
+
+def test_update_keeps_opencode_enabled_flag(tmp_path):
+    path = tmp_path / "opencode.json"
+    _write(path, {"mcp": {"blender": {"type": "local", "command": ["uvx", "mcp-for-blender"],
+                                      "enabled": False, "environment": {"BLENDER_HOST": "studio-pc"}}}})
+    client = _client(path, "opencode")
+    assert configure_json_client(client, UVX, json_client_state(client, PINNED), PINNED).ok
+    assert json.loads(path.read_text())["mcp"]["blender"] == {
+        "type": "local", "command": [UVX, *PINNED_ARGS], "enabled": False,
+        "environment": {"BLENDER_HOST": "studio-pc"}}
+
+
 # --- Codex -------------------------------------------------------------------
 
 def test_codex_state_reads_config_toml(tmp_path):
@@ -246,6 +306,112 @@ def test_codex_plugin_counts_as_configured(tmp_path):
     assert codex_state(env).status == CONFIGURED
 
 
+def _plugin(codex_home: Path, args: list[str]) -> None:
+    """A cached MCP for Blender plugin whose .mcp.json runs uvx `args`."""
+    path = codex_home / "plugins" / "cache" / "mcp-for-blender" / "mcp-for-blender" / "2.1.1" / ".mcp.json"
+    _write(path, {"mcpServers": {"mcp-for-blender": {"command": "uvx", "args": args}}})
+
+
+def test_codex_plugin_from_this_fork_is_configured_unpinned(tmp_path):
+    _plugin(tmp_path, FORK_ARGS)  # its .mcp.json can't name a commit
+    state = codex_state({"CODEX_HOME": str(tmp_path)}, PINNED)
+    assert (state.status, state.manual) == (CONFIGURED, "")
+
+
+def test_upstream_codex_plugin_needs_reinstalling(tmp_path):
+    _plugin(tmp_path, ["mcp-for-blender"])
+    state = codex_state({"CODEX_HOME": str(tmp_path)}, PINNED)
+    assert (state.status, state.detail) == (OUTDATED, "the MCP for Blender plugin runs mcp-for-blender from PyPI")
+    assert state.manual == (
+        "Reinstall the plugin from this fork's marketplace: git clone https://github.com/JosueMFlores/"
+        "mcp-for-blender.git && codex plugin marketplace add ./mcp-for-blender/integrations/codex")
+
+
+def test_codex_plugin_with_pypi_source(tmp_path, pypi):
+    env = {"CODEX_HOME": str(tmp_path)}
+    _plugin(tmp_path, ["mcp-for-blender"])
+    assert codex_state(env).status == CONFIGURED
+    _plugin(tmp_path, FORK_ARGS)
+    state = codex_state(env)
+    assert state.status == OUTDATED
+    assert "git clone https://github.com/ahujasid/blender-mcp.git" in state.manual
+
+
+CODEX_TOML = f"""model = "o3"
+
+# Blender on the studio PC
+[mcp_servers.blender]
+command = "uvx"  # from PATH
+args = [
+  "--from",
+  "{GIT_SOURCE}@{OLD_SHA}",
+  "mcp-for-blender",
+]
+tool_timeout_sec = 600
+
+[mcp_servers.blender.env]
+BLENDER_HOST = "studio-pc"
+
+[mcp_servers.other]
+command = "npx"
+args = ["other"]
+"""
+
+
+def _codex(tmp_path, monkeypatch) -> Client:
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: pytest.fail(f"ran {args}"))
+    return Client("codex", "Codex", "codex", cli_path="/bin/codex")
+
+
+def test_codex_entry_is_edited_in_place(tmp_path, monkeypatch):
+    client = _codex(tmp_path, monkeypatch)
+    config = tmp_path / "config.toml"
+    config.write_text(CODEX_TOML)
+    state = codex_state(target=PINNED)
+    assert (state.status, state.entry_key) == (STALE, "blender")
+    assert setup_cli.describe_change(client, UVX, state, PINNED) == f'would update "blender" in {config}'
+
+    result = setup_cli.configure_cli_client(client, UVX, state, PINNED)
+
+    assert result.ok and result.message == f'Updated "blender" in {config}'
+    old_args = f'[\n  "--from",\n  "{GIT_SOURCE}@{OLD_SHA}",\n  "mcp-for-blender",\n]'
+    assert config.read_text() == CODEX_TOML.replace('"uvx"  #', f'"{UVX}"  #').replace(
+        old_args, f'["--from", "{PINNED}", "mcp-for-blender"]')
+    assert result.backup == tmp_path / "config.toml.bak" and result.backup.read_text() == CODEX_TOML
+    assert codex_state(target=PINNED).status == CONFIGURED
+
+
+def test_codex_edit_keeps_line_endings_and_adds_missing_args():
+    text = '[mcp_servers.blender]\r\ncommand = \'blender-mcp\'\r\n[mcp_servers.blender.env]\r\nA = "1"\r\n'
+    edited = setup_cli._codex_set_command(text, "blender", ["C:\\uv\\uvx.exe", *PINNED_ARGS])
+    assert edited == (
+        '[mcp_servers.blender]\r\ncommand = "C:\\\\uv\\\\uvx.exe"\r\n'
+        f'args = ["--from", "{PINNED}", "mcp-for-blender"]\r\n'
+        '[mcp_servers.blender.env]\r\nA = "1"\r\n')
+
+
+def test_codex_entry_that_cant_be_edited_is_re_added_with_its_env(tmp_path, monkeypatch):
+    client = _codex(tmp_path, monkeypatch)
+    # A multi-line string is more than the line edit takes on.
+    (tmp_path / "config.toml").write_text(
+        '[mcp_servers.blender]\ncommand = """uvx"""\nargs = ["blender-mcp"]\ntool_timeout_sec = 600\n'
+        'env = { BLENDER_HOST = "studio-pc" }\n')
+    state = codex_state(target=PINNED)
+    assert state.status == OUTDATED
+    calls = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: calls.append(args) or (True, ""))
+
+    result = setup_cli.configure_cli_client(client, UVX, state, PINNED)
+
+    assert calls == [
+        ["/bin/codex", "mcp", "remove", "blender"],
+        ["/bin/codex", "mcp", "add", "blender", "--env", "BLENDER_MCP_APPS=1", "--env", "BLENDER_MCP_OPENAI_FORMS=1",
+         "--env", "BLENDER_HOST=studio-pc", "--", UVX, *PINNED_ARGS],
+    ]
+    assert result.ok and result.message.endswith("so re-adding it dropped tool_timeout_sec")
+
+
 def test_codex_commands_carry_plugin_env():
     client = Client("codex", "Codex", "codex", cli_path="/bin/codex")
     [add] = setup_cli._cli_commands(client, UVX, ClientState(NEW))
@@ -262,16 +428,26 @@ def test_claude_code_uses_user_scope():
     assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, *FORK_ARGS]
 
 
-def test_claude_code_moves_pypi_entry_to_this_fork(tmp_path, monkeypatch):
+def test_claude_code_moves_pypi_entry_to_this_fork_keeping_env(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
-    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {"type": "stdio", "command": "uvx",
-                                                                  "args": ["mcp-for-blender"]}}})
-    state = setup_cli.claude_code_state()
+    _write(tmp_path / ".claude.json", {"mcpServers": {"blender": {
+        "type": "stdio", "command": "uvx", "args": ["mcp-for-blender"], "env": {"BLENDER_HOST": "studio-pc"}}}})
+    state = setup_cli.claude_code_state(target=PINNED)
     assert (state.status, state.entry_key) == (OUTDATED, "blender")
     client = Client("claude-code", "Claude Code", "claude-code", cli_path="/bin/claude")
-    remove, add = setup_cli._cli_commands(client, UVX, state)
+    calls = []
+    monkeypatch.setattr(setup_cli, "_run_cli", lambda args: calls.append(args) or (True, ""))
+
+    result = setup_cli.configure_cli_client(client, UVX, state, PINNED)
+
+    assert result.ok and result.message == 'Updated "blender" (user scope, all projects)'
+    remove, add = calls
     assert remove == ["/bin/claude", "mcp", "remove", "--scope", "user", "blender"]
-    assert add == ["/bin/claude", "mcp", "add", "--scope", "user", "blender", "--", UVX, *FORK_ARGS]
+    # Re-added whole, so the env (a remote Blender here) survives.
+    assert add[:6] == ["/bin/claude", "mcp", "add-json", "--scope", "user", "blender"]
+    assert json.loads(add[6]) == {"type": "stdio", "command": UVX, "args": PINNED_ARGS,
+                                  "env": {"BLENDER_HOST": "studio-pc"}}
+    assert "add-json --scope user blender '{" in setup_cli.describe_change(client, UVX, state, PINNED)
 
 
 # --- detection ---------------------------------------------------------------
@@ -361,7 +537,7 @@ def test_dry_run_changes_nothing(home, monkeypatch, capsys):
 def test_run_setup_configures_and_skips_configured(home, monkeypatch, capsys):
     cursor = home / ".cursor" / "mcp.json"
     vscode = home / "vscode" / "mcp.json"
-    _write(vscode, {"servers": {"blender": {"command": "uvx", "args": FORK_ARGS}}})
+    _write(vscode, {"servers": {"blender": {"command": "uvx", "args": PINNED_ARGS}}})
     vscode_before = vscode.read_text()
     monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
     monkeypatch.setattr(setup_cli, "detect_clients", lambda: [
@@ -384,10 +560,91 @@ def test_run_setup_moves_pypi_entries_to_this_fork(home, monkeypatch, capsys):
     monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
 
     assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
-    assert json.loads(cursor.read_text())["mcpServers"] == {"blender": {"command": UVX, "args": FORK_ARGS}}
+    assert json.loads(cursor.read_text())["mcpServers"] == {"blender": {"command": UVX, "args": PINNED_ARGS}}
     out = capsys.readouterr().out
     assert "will update (runs mcp-for-blender from PyPI)" in out
     assert 'Updated "blender"' in out
+
+
+def test_run_setup_pins_entries_to_the_current_commit(home, monkeypatch, capsys, ls_remote):
+    cursor = home / ".cursor" / "mcp.json"
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"]["blender"] == {"command": UVX, "args": PINNED_ARGS}
+    assert ls_remote == [["git", "ls-remote", REPO_URL, "HEAD"]]
+    out = capsys.readouterr().out
+    assert f"Clients will run commit {SHA[:12]}; `uvx --from {GIT_SOURCE} mcp-for-blender update`" in out
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert "Cursor  already set up" in capsys.readouterr().out
+
+
+def test_run_setup_moves_an_older_commit_and_keeps_env(home, monkeypatch, capsys):
+    cursor = home / ".cursor" / "mcp.json"
+    _write(cursor, {"mcpServers": {"blender": {
+        "command": UVX, "args": ["--from", f"{GIT_SOURCE}@{OLD_SHA}", "mcp-for-blender"], "env": {"A": "1"}}}})
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"] == {"blender": {
+        "command": UVX, "args": PINNED_ARGS, "env": {"A": "1"}}}
+    assert "will update (runs an older commit of this fork)" in capsys.readouterr().out
+
+
+def test_run_setup_without_github_falls_back_to_unpinned(home, monkeypatch, capsys, offline):
+    cursor = home / ".cursor" / "mcp.json"
+    vscode = home / "vscode" / "mcp.json"
+    _write(vscode, {"servers": {"blender": {"command": UVX, "args": PINNED_ARGS}}})
+    vscode_before = vscode.read_text()
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [
+        Client("cursor", "Cursor", "json", cursor), Client("vscode", "VS Code", "json", vscode, style="vscode")])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"]["blender"]["args"] == FORK_ARGS
+    assert vscode.read_text() == vscode_before  # pinned already, and nothing newer to compare with
+    out = capsys.readouterr().out
+    assert "Couldn't look up its latest commit (fatal: unable to access" in out
+    assert "won't be pinned" in out
+
+
+def test_run_setup_uses_a_source_with_a_rev_as_is(home, monkeypatch, ls_remote):
+    monkeypatch.setenv(SOURCE_ENV, "git+https://example.com/me/fork@dev")
+    cursor = home / ".cursor" / "mcp.json"
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"]["blender"]["args"] == [
+        "--from", "git+https://example.com/me/fork@dev", "mcp-for-blender"]
+    assert ls_remote == []
+
+
+def test_run_setup_with_pypi_source_writes_plain_entries(home, monkeypatch, pypi, ls_remote):
+    cursor = home / ".cursor" / "mcp.json"
+    _write(cursor, {"mcpServers": {"blender": {"command": UVX, "args": PINNED_ARGS, "env": {"A": "1"}}}})
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    assert json.loads(cursor.read_text())["mcpServers"] == {"blender": {
+        "command": UVX, "args": ["mcp-for-blender"], "env": {"A": "1"}}}
+    assert ls_remote == []
+
+
+def test_run_setup_leaves_an_outdated_codex_plugin_to_the_user(home, monkeypatch, capsys):
+    client = _codex(home / ".codex", monkeypatch)
+    _plugin(home / ".codex", ["mcp-for-blender"])
+    monkeypatch.setattr(setup_cli, "find_uvx", lambda: UVX)
+    monkeypatch.setattr(setup_cli, "detect_clients", lambda: [client])
+
+    assert setup_cli.run_setup(assume_yes=True, skip_addon=True) == 0
+    out = capsys.readouterr().out
+    assert "Codex  needs a step setup can't take (the MCP for Blender plugin runs mcp-for-blender from PyPI)" in out
+    assert "codex plugin marketplace add ./mcp-for-blender/integrations/codex" in out
 
 
 def test_run_setup_needs_uvx(monkeypatch, capsys):

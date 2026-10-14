@@ -4,20 +4,28 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
 from pathlib import Path
 
 import pytest
 
+from blender_mcp import distribution
 from blender_mcp.distribution import (
     GIT_SOURCE,
     PACKAGE,
     REPO_URL,
     SOURCE_ENV,
     describe_source,
+    fork_command,
+    pin_source,
+    pip_command,
     server_source,
+    split_rev,
     uvx_args,
     uvx_command,
 )
+
+SHA = "1a2b3c4d5e6f" + "0" * 28
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -64,6 +72,86 @@ def test_server_source_reads_the_env_it_is_given():
 def test_command_quotes_a_path_with_spaces(monkeypatch):
     monkeypatch.setenv(SOURCE_ENV, "/Users/me/my checkout")
     assert uvx_command("setup") == 'uvx --from "/Users/me/my checkout" mcp-for-blender setup'
+
+
+def test_fork_command_carries_a_non_default_source():
+    setup = f"uvx --from {GIT_SOURCE} mcp-for-blender setup"
+    assert fork_command("setup", env={}) == setup
+    # PyPI's setup is upstream's, so this fork's runs, told to write PyPI entries.
+    assert fork_command("setup", env={SOURCE_ENV: "pypi"}, platform="linux") == f"{SOURCE_ENV}=pypi {setup}"
+    assert fork_command("setup", env={SOURCE_ENV: "pypi"}, platform="win32") == f'$env:{SOURCE_ENV}="pypi"; {setup}'
+    assert fork_command("update", env={SOURCE_ENV: "/src/my checkout"}, platform="darwin") == (
+        f'{SOURCE_ENV}="/src/my checkout" uvx --from "/src/my checkout" mcp-for-blender update')
+
+
+def test_pip_command():
+    assert pip_command(None) == "pip install -U mcp-for-blender"
+    # pip skips a direct URL whose version it already has.
+    assert pip_command(GIT_SOURCE) == f"pip install --upgrade --force-reinstall {GIT_SOURCE}"
+    assert pip_command("/src/my checkout") == 'pip install --upgrade --force-reinstall "/src/my checkout"'
+
+
+# --- pinning client entries to a commit --------------------------------------
+
+@pytest.mark.parametrize("source, base, rev", [
+    (GIT_SOURCE, GIT_SOURCE, None),
+    (f"{GIT_SOURCE}@{SHA}", GIT_SOURCE, SHA),
+    ("git+https://example.com/me/fork.git@feature/x", "git+https://example.com/me/fork.git", "feature/x"),
+    ("git+ssh://git@github.com/me/fork", "git+ssh://git@github.com/me/fork", None),
+    ("git+ssh://git@github.com/me/fork@v2#subdirectory=pkg", "git+ssh://git@github.com/me/fork#subdirectory=pkg", "v2"),
+    ("git+file:///src/fork@main", "git+file:///src/fork", "main"),
+    ("/Users/me@work/checkout", "/Users/me@work/checkout", None),
+])
+def test_split_rev(source, base, rev):
+    assert split_rev(source) == (base, rev)
+
+
+def _git(monkeypatch, result):
+    """Fake subprocess.run: `result` is what it returns or raises; returns its calls."""
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        if isinstance(result, BaseException):
+            raise result
+        return subprocess.CompletedProcess(cmd, *result)
+
+    monkeypatch.setattr(distribution.subprocess, "run", run)
+    return calls
+
+
+def test_pin_source_pins_to_the_repos_head(monkeypatch):
+    calls = _git(monkeypatch, (0, f"{SHA}\tHEAD\n", ""))
+    assert pin_source(GIT_SOURCE) == (f"{GIT_SOURCE}@{SHA}", "")
+    [(cmd, kwargs)] = calls
+    assert cmd == ["git", "ls-remote", REPO_URL, "HEAD"]
+    assert kwargs["timeout"] <= 15 and kwargs["env"]["GIT_TERMINAL_PROMPT"] == "0"
+
+
+def test_pin_source_keeps_a_fragment_after_the_commit(monkeypatch):
+    calls = _git(monkeypatch, (0, f"{SHA}\tHEAD\n", ""))
+    assert pin_source("git+https://example.com/fork#subdirectory=pkg") == (
+        f"git+https://example.com/fork@{SHA}#subdirectory=pkg", "")
+    assert calls[0][0][2] == "https://example.com/fork"
+
+
+@pytest.mark.parametrize("result, error", [
+    ((128, "", "fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com\n"),
+     "fatal: unable to access 'https://github.com/x/': Could not resolve host: github.com"),
+    ((0, "", ""), "git ls-remote didn't report a HEAD commit"),
+    (FileNotFoundError(2, "No such file or directory", "git"), "couldn't run git: "),
+    (subprocess.TimeoutExpired(["git"], 10), "git ls-remote timed out after 10s"),
+])
+def test_pin_source_falls_back_to_unpinned(monkeypatch, result, error):
+    _git(monkeypatch, result)
+    source, reason = pin_source(GIT_SOURCE)
+    assert source == GIT_SOURCE and reason.startswith(error)
+
+
+@pytest.mark.parametrize("source", [None, f"{GIT_SOURCE}@dev", "/src/checkout"])
+def test_pin_source_leaves_other_sources_alone(monkeypatch, source):
+    monkeypatch.setattr(distribution.subprocess, "run", lambda *a, **kw: pytest.fail("no lookup needed"))
+    assert pin_source(source) == (source, "")
 
 
 # --- everything else that names the source ------------------------------------

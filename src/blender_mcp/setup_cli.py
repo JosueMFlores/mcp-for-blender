@@ -5,11 +5,13 @@ Detects installed clients, adds a `blender` server entry that runs uvx by its
 absolute path (GUI apps don't inherit the terminal's PATH, hence `spawn uvx
 ENOENT`), installs the addon, and enables it by running Blender headless.
 Entries run the server from this fork's repo unless BLENDER_MCP_SOURCE says
-otherwise (see distribution.py).
+otherwise (see distribution.py), pinned to the commit it is on now so clients
+start from uv's cache without fetching it; `update` moves them to newer ones.
 
 Config files are merged, never replaced: other servers are kept and a .bak of
 the previous file is written beside it. Claude Code and Codex are configured
-through their own CLIs, which own those files.
+through their own CLIs, which own those files, except that an existing Codex
+entry is edited in place: `codex mcp add` would drop its other settings.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import glob
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,7 +32,18 @@ from .addon_manager import (
     find_existing_addon_installs,
     install_addon,
 )
-from .distribution import PACKAGE, describe_source, server_source, uvx_args
+from .distribution import (
+    GIT_SOURCE,
+    PACKAGE,
+    REPO_URL,
+    UPSTREAM_REPO_URL,
+    describe_source,
+    fork_command,
+    pin_source,
+    run_args,
+    server_source,
+    split_rev,
+)
 
 OLD_PACKAGE = "blender-mcp"
 SERVER_NAME = "blender"
@@ -48,7 +62,10 @@ _PYPI_FROM_RE = re.compile(r"mcp-for-blender(?![\w./\\-])")
 NEW = "new"                # no entry yet: add one
 CONFIGURED = "configured"  # already runs mcp-for-blender from server_source(): leave it alone
 OUTDATED = "outdated"      # runs the old blender-mcp, or mcp-for-blender from elsewhere: offer to update
+STALE = "stale"            # runs the right source at another commit than the one pinned: update it
 UNREADABLE = "unreadable"  # config exists but isn't valid JSON: don't touch
+# Statuses whose entry is rewritten in place, under the key it already has.
+REWRITE = (OUTDATED, STALE)
 
 
 @dataclass
@@ -69,6 +86,9 @@ class ClientState:
     status: str
     entry_key: str | None = None
     detail: str = ""
+    # A step setup can't take itself (reinstalling the Codex plugin); the
+    # client is then only listed with it.
+    manual: str = ""
 
 
 @dataclass
@@ -295,12 +315,19 @@ def _servers_key(style: str) -> str:
     return {"vscode": "servers", "opencode": "mcp"}.get(style, "mcpServers")
 
 
-def server_entry(style: str, uvx: str) -> dict:
+def _server_command(uvx: str, target: str | None) -> list[str]:
+    """What an entry runs. `target` is the `--from` it should run, as
+    pin_source() gave it; None: server_source() as it is."""
+    return [uvx, *run_args(target or server_source())]
+
+
+def server_entry(style: str, uvx: str, target: str | None = None) -> dict:
+    command = _server_command(uvx, target)
     if style == "vscode":
-        return {"type": "stdio", "command": uvx, "args": uvx_args()}
+        return {"type": "stdio", "command": command[0], "args": command[1:]}
     if style == "opencode":
-        return {"type": "local", "command": [uvx, *uvx_args()], "enabled": True}
-    return {"command": uvx, "args": uvx_args()}
+        return {"type": "local", "command": command, "enabled": True}
+    return {"command": command[0], "args": command[1:]}
 
 
 def _entry_argv(entry) -> list[str]:
@@ -331,52 +358,63 @@ def _from_source(argv: list[str]) -> str | None:
 
 
 def _same_source(a: str | None, b: str | None) -> bool:
+    """Whether two `--from`s name the same source, whatever commit they pin."""
     if a is None or b is None:
         return a is None and b is None
     # A trailing slash or .git names the same repo.
-    a, b = (s.strip().rstrip("/").removesuffix(".git") for s in (a, b))
+    a, b = (split_rev(s.strip())[0].rstrip("/").removesuffix(".git") for s in (a, b))
     return a == b
 
 
-def _entry_status(argv: list[str]) -> tuple[str | None, str]:
-    """(CONFIGURED or OUTDATED, why it's outdated) for a command line that runs
-    this server, (None, "") for anything else."""
+def _entry_status(argv: list[str], target: str | None = None) -> tuple[str | None, str]:
+    """(CONFIGURED, OUTDATED or STALE, why it isn't configured) for a command
+    line that runs this server, (None, "") for anything else. When `target`
+    (see _server_command) names a commit, the same source at another commit,
+    or unpinned, is STALE; otherwise any commit of it will do."""
+    target = target or server_source()
     text = " ".join(argv)
     if _NEW_RE.search(text):
         source = _from_source(argv)
-        if _same_source(source, server_source()):
+        if not _same_source(source, target):
+            return OUTDATED, f"runs {PACKAGE} from {describe_source(source)}"
+        want = split_rev(target)[1] if target else None
+        have = split_rev(source)[1] if source else None
+        if want is None or have == want:
             return CONFIGURED, ""
-        return OUTDATED, f"runs {PACKAGE} from {describe_source(source)}"
+        name = "this fork" if _same_source(source, GIT_SOURCE) else split_rev(source)[0]
+        if have is None:
+            return STALE, f"runs {name} unpinned, so it can't start offline"
+        return STALE, f"runs an older commit of {name}"
     if _OLD_RE.search(text):
         return OUTDATED, f"runs the old {OLD_PACKAGE} package"
     return None, ""
 
 
-def _first_state(entries) -> ClientState:
+def _first_state(entries, target: str | None = None) -> ClientState:
     """CONFIGURED if any (key, argv) runs the server from the current source,
-    else OUTDATED for the first one that runs it from elsewhere, else NEW."""
-    outdated = None
+    else OUTDATED or STALE for the first one that runs it from elsewhere, else NEW."""
+    found = None
     for key, argv in entries:
-        status, detail = _entry_status(argv)
+        status, detail = _entry_status(argv, target)
         if status == CONFIGURED:
             return ClientState(CONFIGURED, key)
-        if status == OUTDATED and outdated is None:
-            outdated = ClientState(OUTDATED, key, detail)
-    return outdated or ClientState(NEW)
+        if status in REWRITE and found is None:
+            found = ClientState(status, key, detail)
+    return found or ClientState(NEW)
 
 
-def servers_state(servers: dict) -> ClientState:
+def servers_state(servers: dict, target: str | None = None) -> ClientState:
     """Whether a client's server map already runs this package from the current source."""
-    return _first_state((key, _entry_argv(entry)) for key, entry in servers.items())
+    return _first_state(((key, _entry_argv(entry)) for key, entry in servers.items()), target)
 
 
-def json_client_state(client: Client) -> ClientState:
+def json_client_state(client: Client, target: str | None = None) -> ClientState:
     try:
         config, _ = read_json_config(client.config_path)
     except (ConfigError, OSError) as e:
         return ClientState(UNREADABLE, detail=str(e))
     servers = config.get(_servers_key(client.style))
-    return servers_state(servers if isinstance(servers, dict) else {})
+    return servers_state(servers if isinstance(servers, dict) else {}, target)
 
 
 def _free_key(servers: dict) -> str:
@@ -387,7 +425,7 @@ def _free_key(servers: dict) -> str:
     return key
 
 
-def configure_json_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
+def configure_json_client(client: Client, uvx: str, state: ClientState, target: str | None = None) -> ClientResult:
     path = client.config_path
     try:
         config, had_comments = read_json_config(path)
@@ -401,11 +439,13 @@ def configure_json_client(client: Client, uvx: str, state: ClientState) -> Clien
     elif not isinstance(servers, dict):
         return ClientResult(client, False, f'"{servers_key}" in {path} isn\'t an object; left it unchanged')
 
-    key = state.entry_key if state.status == OUTDATED else _free_key(servers)
-    entry = server_entry(client.style, uvx)
-    if state.status == OUTDATED and isinstance(servers.get(key), dict):
+    rewrite = state.status in REWRITE
+    key = state.entry_key if rewrite else _free_key(servers)
+    entry = server_entry(client.style, uvx, target)
+    if rewrite and isinstance(servers.get(key), dict):
         # Keep the user's env, enabled flag and so on; replace only the command.
-        entry = {**servers[key], **entry}
+        command = {k: v for k, v in entry.items() if k in ("type", "command", "args")}
+        entry = {**servers[key], **command}
     servers[key] = entry
     if client.style == "opencode":
         config.setdefault("$schema", "https://opencode.ai/config.json")
@@ -422,8 +462,7 @@ def configure_json_client(client: Client, uvx: str, state: ClientState) -> Clien
     except OSError as e:
         return ClientResult(client, False, f"Couldn't write {path}: {e}")
 
-    verb = "Updated" if state.status == OUTDATED else "Added"
-    message = f'{verb} "{key}" in {path}'
+    message = f'{"Updated" if rewrite else "Added"} "{key}" in {path}'
     if had_comments:
         message += " (comments in that file were removed; the original is in the .bak)"
     return ClientResult(client, True, message, backup)
@@ -439,15 +478,20 @@ def _claude_json_path(env) -> Path:
     return Path(config_dir) / ".claude.json" if config_dir else Path.home() / ".claude.json"
 
 
-def claude_code_state(env=None) -> ClientState:
-    """User-scope servers live in the top-level mcpServers of ~/.claude.json."""
+def _claude_code_servers(env) -> dict:
+    """User-scope servers: the top-level mcpServers of ~/.claude.json."""
+    config, _ = read_json_config(_claude_json_path(env))
+    servers = config.get("mcpServers")
+    return servers if isinstance(servers, dict) else {}
+
+
+def claude_code_state(env=None, target: str | None = None) -> ClientState:
     env = os.environ if env is None else env
     try:
-        config, _ = read_json_config(_claude_json_path(env))
+        servers = _claude_code_servers(env)
     except (ConfigError, OSError) as e:
         return ClientState(UNREADABLE, detail=str(e))
-    servers = config.get("mcpServers")
-    return servers_state(servers if isinstance(servers, dict) else {})
+    return servers_state(servers, target)
 
 
 def _codex_home(env) -> Path:
@@ -457,6 +501,19 @@ def _codex_home(env) -> Path:
 
 _TOML_HEADER_RE = re.compile(r"^\s*\[\s*([^\]]+?)\s*\]\s*$", re.MULTILINE)
 _TOML_STRING_RE = re.compile(r'"((?:[^"\\\n]|\\.)*)"|\'([^\'\n]*)\'')
+# Any line that opens with "[": a table header, so the end of the table above.
+_TOML_LINE_HEADER_RE = re.compile(r"^[ \t]*\[.*$", re.MULTILINE)
+_TOML_TABLE_RE = re.compile(r"\s*\[\s*([^\[\]]+?)\s*\]\s*(?:#.*)?$")
+_TOML_KEY_RE = re.compile(r'^[ \t]*([A-Za-z0-9_-]+|"[^"\n]*")[ \t]*=[ \t]*', re.MULTILINE)
+# A one-line string value, then nothing but a comment to the end of its line.
+_TOML_VALUE_RE = re.compile(r'("(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\')[ \t]*(?:#[^\n]*)?(?=\n|\Z)')
+_TOML_LINE_END_RE = re.compile(r"[ \t]*(?:#[^\n]*)?(?=\n|\Z)")
+_TOML_PAIR_RE = re.compile(r'([A-Za-z0-9_-]+|"[^"\n]*")[ \t]*=[ \t]*("(?:[^"\\\n]|\\.)*"|\'[^\'\n]*\')')
+
+
+def _toml_key_parts(name: str) -> list[str]:
+    """["mcp_servers", "my blender"] for the table name mcp_servers."my blender"."""
+    return [p.strip().strip('"\'') for p in re.split(r"\.(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", name)]
 
 
 def _codex_mcp_sections(text: str) -> dict[str, str]:
@@ -468,7 +525,7 @@ def _codex_mcp_sections(text: str) -> dict[str, str]:
     headers = list(_TOML_HEADER_RE.finditer(text))
     sections: dict[str, str] = {}
     for i, match in enumerate(headers):
-        parts = [p.strip().strip('"\'') for p in re.split(r"\.(?=(?:[^\"]*\"[^\"]*\")*[^\"]*$)", match.group(1))]
+        parts = _toml_key_parts(match.group(1))
         if len(parts) < 2 or parts[0] != "mcp_servers":
             continue
         end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
@@ -491,6 +548,160 @@ def _toml_strings(body: str) -> list[str]:
     return strings
 
 
+def _toml_tables(text: str) -> list[tuple[list[str] | None, int, int]]:
+    """(key parts, body start, body end) for each line that opens with "[";
+    parts is None for anything but a plain [table] header."""
+    headers = list(_TOML_LINE_HEADER_RE.finditer(text))
+    tables = []
+    for i, match in enumerate(headers):
+        name = _TOML_TABLE_RE.match(match.group(0))
+        end = headers[i + 1].start() if i + 1 < len(headers) else len(text)
+        tables.append((_toml_key_parts(name.group(1)) if name else None, match.end(), end))
+    return tables
+
+
+def _toml_array_end(text: str, pos: int) -> int | None:
+    """Where the array starting at `pos` ends, across lines; None if there's no
+    array there or anything but a comment follows it on its line."""
+    if not text.startswith("[", pos):
+        return None
+    depth, i = 0, pos
+    while i < len(text):
+        ch = text[i]
+        if ch in "\"'":
+            string = _TOML_STRING_RE.match(text, i)
+            if not string:
+                return None
+            i = string.end()
+            continue
+        if ch == "#":
+            i = text.find("\n", i)
+            if i < 0:
+                return None
+        elif ch == "[":
+            depth += 1
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i + 1 if _TOML_LINE_END_RE.match(text, i + 1) else None
+        i += 1
+    return None
+
+
+def _only_command_changed(before: str, after: str, key: str, command: list[str]) -> bool:
+    """Double-checks an edit of config.toml with a TOML parser, where there is one."""
+    try:
+        import tomllib
+    except ImportError:  # Python 3.10: the careful line edit has to do
+        return True
+    try:
+        old, new = tomllib.loads(before), tomllib.loads(after)
+    except ValueError:
+        return False
+    servers = old.get("mcp_servers")
+    table = servers.get(key) if isinstance(servers, dict) else None
+    if not isinstance(table, dict):
+        return False
+    table.update(command=command[0], args=command[1:])
+    return old == new
+
+
+def _codex_set_command(text: str, key: str, command: list[str]) -> str | None:
+    """`text` with [mcp_servers.<key>] running `command`. Only its command and
+    args values change, so its env, timeouts and comments stay; None if the
+    table isn't laid out plainly enough to be sure of that."""
+    crlf = "\r\n" in text
+    text = text.replace("\r\n", "\n")
+    spans = [(start, end) for parts, start, end in _toml_tables(text) if parts == ["mcp_servers", key]]
+    if len(spans) != 1:
+        return None
+    start, end = spans[0]
+    body = text[start:end]
+    if '"""' in body or "'''" in body:
+        return None
+    keys = [(m.group(1).strip('"'), m) for m in _TOML_KEY_RE.finditer(body)]
+    commands = [m for name, m in keys if name == "command"]
+    args = [m for name, m in keys if name == "args"]
+    if len(commands) != 1 or len(args) > 1:
+        return None
+    value = _TOML_VALUE_RE.match(body, commands[0].end())
+    if not value:
+        return None
+    # JSON strings are valid TOML basic strings.
+    new_args = "[" + ", ".join(map(json.dumps, command[1:])) + "]"
+    edits = [(value.start(1), value.end(1), json.dumps(command[0]))]
+    if args:
+        array_end = _toml_array_end(body, args[0].end())
+        if array_end is None:
+            return None
+        edits.append((args[0].end(), array_end, new_args))
+    else:
+        indent = re.match(r"[ \t]*", body[commands[0].start():]).group(0)
+        edits.append((value.end(), value.end(), f"\n{indent}args = {new_args}"))
+    for edit_start, edit_end, new in sorted(edits, reverse=True):
+        body = body[:edit_start] + new + body[edit_end:]
+    edited = text[:start] + body + text[end:]
+    if not _only_command_changed(text, edited, key, command):
+        return None
+    return edited.replace("\n", "\r\n") if crlf else edited
+
+
+def _toml_pairs(text: str) -> dict[str, str]:
+    return {m.group(1).strip('"'): _toml_strings(m.group(2))[0] for m in _TOML_PAIR_RE.finditer(text)}
+
+
+def _codex_table_settings(text: str, key: str) -> tuple[dict[str, str], list[str]]:
+    """(env, names of its other settings) of [mcp_servers.<key>]: what re-adding
+    it with `codex mcp add --env` keeps, and what that loses."""
+    text = text.replace("\r\n", "\n")
+    env: dict[str, str] = {}
+    other: list[str] = []
+    for parts, start, end in _toml_tables(text):
+        if not parts or parts[:2] != ["mcp_servers", key]:
+            continue
+        body = text[start:end]
+        if parts[2:] == ["env"]:
+            env.update(_toml_pairs(body))
+        elif len(parts) > 2:
+            other.append(".".join(parts[2:]))
+        else:
+            for m in _TOML_KEY_RE.finditer(body):
+                name = m.group(1).strip('"')
+                if name == "env":  # an inline table
+                    env.update(_toml_pairs(body[m.end():].split("\n", 1)[0]))
+                elif name not in ("command", "args"):
+                    other.append(name)
+    return env, other
+
+
+def _codex_config() -> tuple[Path, str | None]:
+    """config.toml and its text; None if it can't be read."""
+    path = _codex_home(os.environ) / "config.toml"
+    try:
+        return path, path.read_bytes().decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return path, None
+
+
+def _configure_codex_in_place(client: Client, command: list[str], key: str) -> ClientResult | None:
+    """Point an existing Codex entry at `command` by editing config.toml; None
+    if it can't be edited safely."""
+    path, text = _codex_config()
+    edited = _codex_set_command(text, key, command) if text is not None else None
+    if edited is None:
+        return None
+    backup = path.with_name(path.name + ".bak")
+    try:
+        shutil.copy2(path, backup)
+        staged = path.with_name(path.name + ".tmp")
+        # Bytes, so its line endings stay as they were.
+        staged.write_bytes(edited.encode("utf-8"))
+        os.replace(staged, path)
+    except OSError as e:
+        return ClientResult(client, False, f"Couldn't write {path}: {e}")
+    return ClientResult(client, True, f'Updated "{key}" in {path}', backup)
+
+
 def codex_plugin_installed(env=None) -> bool:
     env = os.environ if env is None else env
     home = _codex_home(env)
@@ -503,17 +714,50 @@ def codex_plugin_installed(env=None) -> bool:
     return re.search(r'^\s*\[\s*plugins\.\s*"' + re.escape(CODEX_PLUGIN_NAME) + "@", text, re.MULTILINE) is not None
 
 
-def codex_state(env=None) -> ClientState:
-    env = os.environ if env is None else env
-    if codex_plugin_installed(env):
+def _codex_plugin_fix(source: str | None) -> str:
+    """How to get the plugin that runs `source` (None: PyPI, so upstream's)."""
+    repo, whose = (UPSTREAM_REPO_URL, "upstream's") if source is None else (REPO_URL, "this fork's")
+    folder = repo.rsplit("/", 1)[1]
+    return (f"Reinstall the plugin from {whose} marketplace: git clone {repo}.git && "
+            f"codex plugin marketplace add ./{folder}/integrations/codex")
+
+
+def _codex_plugin_state(env) -> ClientState | None:
+    """What the MCP for Blender plugin runs, going by the .mcp.json in Codex's
+    plugin cache; None if the plugin isn't installed."""
+    entries = []
+    for plugin in glob.glob(str(_codex_home(env) / "plugins" / "cache" / "*" / CODEX_PLUGIN_NAME)):
+        for path in glob.glob(os.path.join(plugin, "**", ".mcp.json"), recursive=True):
+            try:
+                config, _ = read_json_config(Path(path))
+            except (ConfigError, OSError):
+                continue
+            servers = config.get("mcpServers")
+            if isinstance(servers, dict):
+                entries += [(CODEX_PLUGIN_NAME, _entry_argv(entry)) for entry in servers.values()]
+    source = server_source()
+    # A plugin's .mcp.json names no commit, so any commit of the source will do.
+    state = _first_state(entries, split_rev(source)[0] if source else None)
+    if state.status == OUTDATED:
+        return ClientState(OUTDATED, CODEX_PLUGIN_NAME, f"the MCP for Blender plugin {state.detail}",
+                           manual=_codex_plugin_fix(source))
+    if state.status == CONFIGURED or codex_plugin_installed(env):
         return ClientState(CONFIGURED, CODEX_PLUGIN_NAME, detail="MCP for Blender plugin installed")
+    return None
+
+
+def codex_state(env=None, target: str | None = None) -> ClientState:
+    env = os.environ if env is None else env
+    plugin = _codex_plugin_state(env)
+    if plugin:
+        return plugin
     try:
         text = (_codex_home(env) / "config.toml").read_text(encoding="utf-8")
     except FileNotFoundError:
         return ClientState(NEW)
     except OSError as e:
         return ClientState(UNREADABLE, detail=str(e))
-    return _first_state((name, _toml_strings(body)) for name, body in _codex_mcp_sections(text).items())
+    return _first_state(((name, _toml_strings(body)) for name, body in _codex_mcp_sections(text).items()), target)
 
 
 def _run_cli(args: list[str]) -> tuple[bool, str]:
@@ -525,55 +769,85 @@ def _run_cli(args: list[str]) -> tuple[bool, str]:
     return proc.returncode == 0, output
 
 
-def _cli_commands(client: Client, uvx: str, state: ClientState) -> list[list[str]]:
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
-    commands: list[list[str]] = []
+def _shown(command: list[str]) -> str:
+    return " ".join(shlex.quote(a) for a in [Path(command[0]).name, *command[1:]])
+
+
+def _cli_commands(client: Client, uvx: str, state: ClientState, target: str | None = None) -> list[list[str]]:
+    """The CLI calls that add the entry, or remove and re-add it under its key.
+    A Codex entry is edited in place instead when it can be (see configure_cli_client)."""
+    command = _server_command(uvx, target)
+    rewrite = state.status in REWRITE
+    key = state.entry_key if rewrite else SERVER_NAME
+    cli = client.cli_path
     if client.kind == "claude-code":
-        if state.status == OUTDATED:
-            commands.append([client.cli_path, "mcp", "remove", "--scope", "user", key])
-        commands.append([client.cli_path, "mcp", "add", "--scope", "user", key, "--", uvx, *uvx_args()])
-    else:
-        if state.status == OUTDATED:
-            commands.append([client.cli_path, "mcp", "remove", key])
-        env_flags = [flag for k, v in CODEX_ENV.items() for flag in ("--env", f"{k}={v}")]
-        commands.append([client.cli_path, "mcp", "add", key, *env_flags, "--", uvx, *uvx_args()])
-    return commands
+        add = [cli, "mcp", "add", "--scope", "user", key, "--", *command]
+        if not rewrite:
+            return [add]
+        try:
+            entry = _claude_code_servers(os.environ).get(key)
+        except (ConfigError, OSError):
+            entry = None
+        if isinstance(entry, dict):
+            # `mcp add` would drop its env and the rest; add-json takes it all back.
+            entry = {**entry, "command": command[0], "args": command[1:]}
+            add = [cli, "mcp", "add-json", "--scope", "user", key, json.dumps(entry)]
+        return [[cli, "mcp", "remove", "--scope", "user", key], add]
+    env = dict(CODEX_ENV)
+    if rewrite:
+        _, text = _codex_config()
+        env.update(_codex_table_settings(text or "", key)[0])
+    env_flags = [flag for k, v in env.items() for flag in ("--env", f"{k}={v}")]
+    add = [cli, "mcp", "add", key, *env_flags, "--", *command]
+    return [[cli, "mcp", "remove", key], add] if rewrite else [add]
 
 
-def configure_cli_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
-    for command in _cli_commands(client, uvx, state):
+def configure_cli_client(client: Client, uvx: str, state: ClientState, target: str | None = None) -> ClientResult:
+    rewrite = state.status in REWRITE
+    key = state.entry_key if rewrite else SERVER_NAME
+    dropped: list[str] = []
+    if client.kind == "codex" and rewrite:
+        result = _configure_codex_in_place(client, _server_command(uvx, target), key)
+        if result:
+            return result
+        _, text = _codex_config()
+        dropped = _codex_table_settings(text or "", key)[1]
+    for command in _cli_commands(client, uvx, state, target):
         ok, output = _run_cli(command)
         if not ok:
-            shown = " ".join(Path(command[0]).name if i == 0 else a for i, a in enumerate(command))
-            return ClientResult(client, False, f"`{shown}` failed: {output or 'no output'}")
-    verb = "Updated" if state.status == OUTDATED else "Added"
-    key = state.entry_key if state.status == OUTDATED else SERVER_NAME
+            return ClientResult(client, False, f"`{_shown(command)}` failed: {output or 'no output'}")
     where = "user scope, all projects" if client.kind == "claude-code" else "~/.codex/config.toml"
-    return ClientResult(client, True, f'{verb} "{key}" ({where})')
+    message = f'{"Updated" if rewrite else "Added"} "{key}" ({where})'
+    if dropped:
+        message += f"; it couldn't be edited in place, so re-adding it dropped {', '.join(dropped)}"
+    return ClientResult(client, True, message)
 
 
-def client_state(client: Client) -> ClientState:
+def client_state(client: Client, target: str | None = None) -> ClientState:
     if client.kind == "claude-code":
-        return claude_code_state()
+        return claude_code_state(target=target)
     if client.kind == "codex":
-        return codex_state()
-    return json_client_state(client)
+        return codex_state(target=target)
+    return json_client_state(client, target)
 
 
-def configure_client(client: Client, uvx: str, state: ClientState) -> ClientResult:
+def configure_client(client: Client, uvx: str, state: ClientState, target: str | None = None) -> ClientResult:
     if client.kind == "json":
-        return configure_json_client(client, uvx, state)
-    return configure_cli_client(client, uvx, state)
+        return configure_json_client(client, uvx, state, target)
+    return configure_cli_client(client, uvx, state, target)
 
 
-def describe_change(client: Client, uvx: str, state: ClientState) -> str:
+def describe_change(client: Client, uvx: str, state: ClientState, target: str | None = None) -> str:
     """What configure_client would do, for --dry-run."""
+    rewrite = state.status in REWRITE
     if client.kind == "json":
-        verb = f'update "{state.entry_key}"' if state.status == OUTDATED else f'add "{SERVER_NAME}"'
+        verb = f'update "{state.entry_key}"' if rewrite else f'add "{SERVER_NAME}"'
         return f"would {verb} in {client.config_path}"
-    return "would run: " + " && ".join(
-        " ".join([Path(c[0]).name, *c[1:]]) for c in _cli_commands(client, uvx, state)
-    )
+    if client.kind == "codex" and rewrite:
+        path, text = _codex_config()
+        if text is not None and _codex_set_command(text, state.entry_key, _server_command(uvx, target)):
+            return f'would update "{state.entry_key}" in {path}'
+    return "would run: " + " && ".join(map(_shown, _cli_commands(client, uvx, state, target)))
 
 
 # ---------------------------------------------------------------------------
@@ -779,6 +1053,7 @@ def setup_addon(dry_run: bool) -> AddonOutcome:
 _STATUS_LABEL = {
     NEW: "will add",
     OUTDATED: "will update",
+    STALE: "will update",
     CONFIGURED: "already set up",
     UNREADABLE: "config isn't valid JSON, skipping",
 }
@@ -809,10 +1084,19 @@ def _ask(prompt: str) -> str:
 
 def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool = False) -> int:
     print("MCP for Blender setup" + (" (dry run: nothing will be changed)" if dry_run else ""))
-    print(f"Server source: {describe_source(server_source())}")
-    print()
+    source = server_source()
+    print(f"Server source: {describe_source(source)}")
 
     uvx = find_uvx()
+    # Looked up once, so every client is pinned to the same commit.
+    target, pin_error = pin_source(source) if uvx else (source, "")
+    if pin_error:
+        print(f"  Couldn't look up its latest commit ({pin_error}), so clients won't be pinned to one:")
+        print("  they'll fetch it each time they start the server, which needs the network.")
+    elif target != source:
+        print(f"  Clients will run commit {split_rev(target)[1][:12]}; "
+              f"`{fork_command('update')}` moves them to newer ones.")
+    print()
     if not uvx:
         print("Couldn't find uvx. Install uv first: https://docs.astral.sh/uv/getting-started/installation/")
         return 1
@@ -820,7 +1104,7 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
     interactive = not assume_yes and sys.stdin is not None and sys.stdin.isatty()
 
     clients = detect_clients()
-    states = [(c, client_state(c)) for c in clients]
+    states = [(c, client_state(c, target)) for c in clients]
     if not states:
         print("No MCP clients found (Claude Desktop, Claude Code, Codex, Cursor, VS Code,")
         print("Devin Desktop/Windsurf, OpenCode, Antigravity). See the README for other clients.")
@@ -828,17 +1112,19 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
         print("Found:")
         width = max(len(c.name) for c, _ in states)
         for c, s in states:
-            label = _STATUS_LABEL[s.status]
-            if s.status in (CONFIGURED, OUTDATED) and s.detail:
+            label = "needs a step setup can't take" if s.manual else _STATUS_LABEL[s.status]
+            if s.status in (CONFIGURED, *REWRITE) and s.detail:
                 label += f" ({s.detail})"
             print(f"  {c.name.ljust(width)}  {label}")
+            if s.manual:
+                print(f"  {' ' * width}  {s.manual}")
         print()
 
-    actionable = [(c, s) for c, s in states if s.status in (NEW, OUTDATED)]
+    actionable = [(c, s) for c, s in states if s.status in (NEW, *REWRITE) and not s.manual]
     chosen = actionable
     if actionable and interactive:
         for i, (c, s) in enumerate(actionable, 1):
-            print(f"  {i}. {c.name}" + ("  (update)" if s.status == OUTDATED else ""))
+            print(f"  {i}. {c.name}" + ("  (update)" if s.status in REWRITE else ""))
         while True:
             picked = _parse_selection(
                 _ask("Configure which? [Enter = all, numbers like 1 3, n = none]: "), len(actionable))
@@ -851,9 +1137,9 @@ def run_setup(dry_run: bool = False, assume_yes: bool = False, skip_addon: bool 
     results: list[ClientResult] = []
     for client, state in chosen:
         if dry_run:
-            print(f"  {client.name}: {describe_change(client, uvx, state)}")
+            print(f"  {client.name}: {describe_change(client, uvx, state, target)}")
             continue
-        result = configure_client(client, uvx, state)
+        result = configure_client(client, uvx, state, target)
         results.append(result)
         print(f"  {'✓' if result.ok else '✗'} {client.name}: {result.message}")
     if chosen:

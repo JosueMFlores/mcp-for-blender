@@ -38,10 +38,11 @@ find_uvx() {
 
 echo "MCP for Blender installer"
 
-# uv clones git sources with git.
+# uv clones git sources with git. Run it rather than look it up: macOS ships
+# /usr/bin/git as a stub that fails until the Command Line Tools are installed.
 case "$SOURCE" in
     git+*)
-        if ! command -v git >/dev/null 2>&1; then
+        if ! git --version >/dev/null 2>&1; then
             echo "MCP for Blender installs from GitHub, which needs git. Install git" >&2
             echo "(https://git-scm.com/downloads; on macOS: xcode-select --install) and run this again." >&2
             exit 1

@@ -10,8 +10,13 @@ addon bundled with the new server rather than the one we are running.
 By default the server comes from this fork's git repo, which has no release
 number to compare against, so it always refreshes:
 `uvx --refresh-package mcp-for-blender --from <repo> mcp-for-blender update`.
-With BLENDER_MCP_SOURCE=pypi it re-runs only when PyPI has something newer, as
-`uvx --refresh-package mcp-for-blender mcp-for-blender@<latest> update`.
+The re-run then moves client entries, which setup pinned to a commit, to the
+one the repo is on now.
+
+With BLENDER_MCP_SOURCE=pypi it hands over to upstream's own update, as
+`uvx --refresh-package mcp-for-blender mcp-for-blender@latest update`, which
+installs upstream's addon; this fork shares upstream's version numbers, so
+comparing them would say nothing.
 """
 
 from __future__ import annotations
@@ -25,8 +30,26 @@ import sys
 from pathlib import Path
 
 from .addon_manager import addon_version_label, update_installed_addons
-from .distribution import PACKAGE, describe_source, server_source, uvx_args, uvx_command
-from .setup_cli import OUTDATED, blender_is_running, client_state, detect_clients, find_uvx
+from .distribution import (
+    PACKAGE,
+    describe_source,
+    fork_command,
+    pin_source,
+    pip_command,
+    server_source,
+    split_rev,
+    uvx_args,
+)
+from .setup_cli import (
+    OUTDATED,
+    STALE,
+    blender_is_running,
+    client_state,
+    configure_client,
+    describe_change,
+    detect_clients,
+    find_uvx,
+)
 
 PYPI_URL = f"https://pypi.org/pypi/{PACKAGE}/json"
 # Set on the re-run to the version we upgraded from; also stops a re-run loop.
@@ -114,7 +137,7 @@ def _update_addon(dry_run: bool) -> tuple[bool, bool]:
         print(f"  {e}")
         return False, True
     if not results:
-        print(f"  Not installed. Run `{uvx_command('setup')}` to install and enable it.")
+        print(f"  Not installed. Run `{fork_command('setup')}` to install and enable it.")
         return False, False
 
     verb = "would update" if dry_run else "updated"
@@ -133,18 +156,65 @@ def _update_addon(dry_run: bool) -> tuple[bool, bool]:
     return updated, any(r.action == "failed" for r in results)
 
 
-def _outdated_clients() -> list[str]:
-    """Clients still set up to run the pre-rename blender-mcp package, or this
-    one from a different source, each with what it runs."""
-    names: list[str] = []
-    for client in detect_clients():
+def _update_clients(source: str | None, dry_run: bool) -> tuple[str | None, bool, bool]:
+    """Move client entries that run `source` at another commit to the one it
+    is on now: setup pinned them, so they'd never update otherwise. Returns
+    (the `--from` entries should run, any updated, any failed)."""
+    clients = detect_clients()
+    if not clients:
+        return source, False, False
+    target, error = pin_source(source)
+    if error:
+        print(f"MCP clients: couldn't look up the latest commit ({error}); pinned ones stay on theirs.")
+        print()
+        return target, False, False
+    stale = []
+    for client in clients:
         try:
-            state = client_state(client)
+            state = client_state(client, target)
         except Exception:
             continue
-        if state.status == OUTDATED:
+        if state.status == STALE:
+            stale.append((client, state))
+    if not stale:
+        return target, False, False
+
+    print(f"MCP clients (to commit {split_rev(target)[1][:12]}):")
+    uvx = find_uvx()
+    if not uvx:
+        print(f"  uvx not found, so they were left alone. Run `{fork_command('setup')}` once it is installed.")
+        print()
+        return target, False, False
+    updated = failed = False
+    for client, state in stale:
+        if dry_run:
+            print(f"  {client.name}: {describe_change(client, uvx, state, target)}")
+            continue
+        result = configure_client(client, uvx, state, target)
+        print(f"  {'✓' if result.ok else '✗'} {client.name}: {result.message}")
+        updated, failed = updated or result.ok, failed or not result.ok
+    print()
+    return target, updated, failed
+
+
+def _outdated_clients(source: str | None, target: str | None = None) -> list[str]:
+    """Lines about the clients still set up to run the pre-rename blender-mcp
+    package, or this one from a different source, and how to switch them."""
+    names: list[str] = []
+    manual: list[str] = []
+    for client in detect_clients():
+        try:
+            state = client_state(client, target)
+        except Exception:
+            continue
+        if state.manual:
+            manual += [f"{client.name}: {state.detail}.", f"  {state.manual}"]
+        elif state.status == OUTDATED:
             names.append(f"{client.name} ({state.detail})" if state.detail else client.name)
-    return names
+    if not names:
+        return manual
+    return [f"Not running the server from {describe_source(source)} yet: {', '.join(names)}.",
+            f"  Run `{fork_command('setup')}` to switch them over.", *manual]
 
 
 def run_update(dry_run: bool = False) -> int:
@@ -158,7 +228,7 @@ def run_update(dry_run: bool = False) -> int:
         print()
 
     server_updated = False
-    pip_command = None
+    pip_hint = None
     if updated_from is not None:
         if source is not None and updated_from == current:
             # Commits on the repo don't always bump the version.
@@ -176,9 +246,21 @@ def run_update(dry_run: bool = False) -> int:
             return _update_server(uvx, uvx_args("update"), dry_run)
         # Re-running update wouldn't find uvx either, so update the addon now
         # and leave the server to pip.
-        pip_command = f"pip install -U {source}"
-        print(f"  uvx not found. If you installed with pip, run: {pip_command}")
+        pip_hint = pip_command(source)
+        print(f"  uvx not found. If you installed with pip, run: {pip_hint}")
     else:
+        uvx = find_uvx()
+        if uvx:
+            # PyPI has upstream's package: its own update knows its releases
+            # and installs its addon, where we'd install this fork's.
+            print(f"Server: {current or 'unknown version'}, handing over to the latest release on PyPI")
+            code = _update_server(uvx, [f"{PACKAGE}@latest", "update"], dry_run)
+            # Upstream's update can't tell which clients still run this fork.
+            lines = _outdated_clients(source)
+            if lines:
+                print()
+                print("\n".join(lines))
+            return code
         latest, error = fetch_latest_version()
         if latest is None:
             print(f"Server: {current or 'unknown version'} (couldn't check PyPI for a newer one: {error})")
@@ -186,30 +268,30 @@ def run_update(dry_run: bool = False) -> int:
             print(f"Server: {current}, the latest release")
         else:
             print(f"Server: {current or 'unknown version'} → {latest}")
-            uvx = find_uvx()
-            if not uvx:
-                print(f"  uvx not found. If you installed with pip, run: pip install -U {PACKAGE}")
-                print(f"  then run `{PACKAGE} update` again to update the addon.")
-                return 1
-            return _update_server(uvx, [f"{PACKAGE}@{latest}", "update"], dry_run)
+            print(f"  uvx not found. If you installed with pip, run: {pip_command(None)}")
+            print(f"  then run `{PACKAGE} update` again to update the addon.")
+            return 1
     print()
 
     addon_updated, addon_failed = _update_addon(dry_run)
     print()
 
-    outdated = _outdated_clients()
-    if outdated:
-        print(f"Not running the server from {describe_source(source)} yet: {', '.join(outdated)}.")
-        print(f"  Run `{uvx_command('setup')}` to switch them over.")
+    target, clients_updated, clients_failed = source, False, False
+    if updated_from is not None:
+        target, clients_updated, clients_failed = _update_clients(source, dry_run)
+
+    lines = _outdated_clients(source, target)
+    if lines:
+        print("\n".join(lines))
         print()
 
     if dry_run:
         return 0
 
     print("Next:")
-    if pip_command:
-        print(f"  • Update the server with `{pip_command}`, then restart your MCP clients.")
-    if server_updated:
+    if pip_hint:
+        print(f"  • Update the server with `{pip_hint}`, then restart your MCP clients.")
+    if server_updated or clients_updated:
         print("  • Restart your MCP clients (Claude Desktop, Cursor, ...) so they start the new server.")
     if addon_updated:
         if blender_is_running():
@@ -217,6 +299,6 @@ def run_update(dry_run: bool = False) -> int:
             print("    'Interface: MCP for Blender', to load the new addon.")
         else:
             print("  • Open Blender. The new addon loads on launch.")
-    if not server_updated and not addon_updated and not pip_command:
+    if not server_updated and not clients_updated and not addon_updated and not pip_hint:
         print("  • Nothing to do: everything is up to date.")
-    return 1 if addon_failed else 0
+    return 1 if addon_failed or clients_failed else 0

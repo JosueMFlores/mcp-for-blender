@@ -39,6 +39,8 @@ This is [JosueMFlores/mcp-for-blender](https://github.com/JosueMFlores/mcp-for-b
 - **Installs and updates from this repo.** The installers, `setup` and `update` run the server with
   `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender` instead of the `mcp-for-blender`
   package on PyPI, which upstream publishes. Install-command hints printed by the server point here too.
+- **`setup` pins client entries to a commit** (`git+…/mcp-for-blender@<commit>`), so the server starts from
+  uv's cache even offline. `update` moves them to the latest commit and refreshes the addon.
 - **The addon's self-updater follows this repo**, so updating from inside Blender never swaps in upstream's addon.
 - **Telemetry is off** unless you configure it.
 - **Roblox export preset** for `export_scene`, with a guide.
@@ -56,10 +58,11 @@ powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/Jos
 
 Already have uv? Run `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup`, and
 `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender update` to update later.
-Installing from GitHub needs `git`.
+Both need `git`: uv clones this repo with it, and they use it to look up the latest commit.
 
 Elsewhere in this README, a bare `uvx mcp-for-blender …` runs upstream's PyPI package; add
-`--from git+https://github.com/JosueMFlores/mcp-for-blender` after `uvx` to run this fork's.
+`--from git+https://github.com/JosueMFlores/mcp-for-blender` after `uvx` to run this fork's, or let `setup`
+write the client entry, pinned.
 
 `BLENDER_MCP_SOURCE` picks where `setup`, `update` and the installers get the server from: unset for this
 fork, `pypi` for upstream's PyPI package, or any other uvx `--from` spec (another git URL, a local checkout).
@@ -249,15 +252,15 @@ The quickest way is the one-line installer. It installs uv, configures your MCP 
 
 ```bash
 # macOS / Linux
-curl -LsSf https://www.mcp-for-blender.com/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.sh | sh
 ```
 
 ```powershell
 # Windows (PowerShell)
-powershell -ExecutionPolicy ByPass -c "irm https://www.mcp-for-blender.com/install.ps1 | iex"
+powershell -ExecutionPolicy ByPass -c "irm https://raw.githubusercontent.com/JosueMFlores/mcp-for-blender/main/install.ps1 | iex"
 ```
 
-Already have uv? Run `uvx mcp-for-blender setup` instead. See [Quickstart](#quickstart) for what it changes. The rest of this section covers manual setup.
+Already have uv? Run `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup` instead. See [Quickstart](#quickstart) for what it changes. The rest of this section covers manual setup.
 
 ### Prerequisites
 
@@ -339,7 +342,7 @@ uv cache clean mcp-for-blender blender-mcp && uvx --refresh mcp-for-blender
 On locked-down machines you can skip uvx entirely with [`pipx`](https://pipx.pypa.io), then point your client at the installed command:
 
 ```bash
-pipx install mcp-for-blender
+pipx install git+https://github.com/JosueMFlores/mcp-for-blender
 pipx ensurepath          # then restart your shell / client
 ```
 
@@ -477,11 +480,11 @@ The Codex CLI, desktop app, and IDE extension all share the same config file (`~
 The plugin adds a live viewport inline in the chat (click an object to attach it to your next message), thumbnail pickers for Poly Haven, Sketchfab and Poly Pizza, and `@`-mentions for scene objects, materials and collections. It isn't in the Codex plugin directory yet, so add it from this repo:
 
 ```bash
-git clone https://github.com/ahujasid/blender-mcp.git
-codex plugin marketplace add ./blender-mcp/integrations/codex
+git clone https://github.com/JosueMFlores/mcp-for-blender.git
+codex plugin marketplace add ./mcp-for-blender/integrations/codex
 ```
 
-Then restart Codex, install **MCP for Blender** from the plugins directory, and ask it to use MCP for Blender in chat. Once it's running, the viewport opens in a side panel next to the conversation:
+Then restart Codex, install **MCP for Blender** from the plugins directory, and ask it to use MCP for Blender in chat. Unlike the entries `setup` writes, the plugin isn't pinned to a commit: it runs the newest one, so Codex needs to reach GitHub to start it. Once it's running, the viewport opens in a side panel next to the conversation:
 
 ![MCP for Blender plugin in the Codex app, showing the live viewport beside the chat](assets/codex-screenshot.png)
 
@@ -602,17 +605,17 @@ env = { BLENDER_HOST = "localhost", BLENDER_PORT = "9876" }
 
 ## Installing the Blender Addon
 
-> `uvx mcp-for-blender setup` (see [Quickstart](#quickstart)) does all of this, including enabling the addon. The steps below are for doing it by hand.
+> `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup` (see [Quickstart](#quickstart)) does all of this, including enabling the addon. The steps below are for doing it by hand.
 
 **1. Recommended** — from a terminal, run:
 
 ```bash
-uvx mcp-for-blender install-addon
+uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender install-addon
 ```
 
 This copies the addon into your Blender addons folder as `blender_mcp.py`. It prints where it wrote to, and keeps a `.bak` of any file it replaces.
 
-> Optional: `uvx mcp-for-blender addon-paths` lists detected Blender addons folders. Override the destination with `BLENDERMCP_ADDONS_DIR=/path/to/scripts/addons`.
+> Optional: `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender addon-paths` lists detected Blender addons folders. Override the destination with `BLENDERMCP_ADDONS_DIR=/path/to/scripts/addons`.
 
 **2.** Open Blender
 
@@ -631,18 +634,16 @@ Then open the **MCP for Blender** tab in Blender's sidebar (press `N` in the 3D 
 **1.** Run:
 
 ```bash
-uvx mcp-for-blender@latest update
+uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender update
 ```
 
-This updates the MCP server (refreshing uv's cached copy, or upgrading a `uv tool install`) and every installed copy of the Blender addon, keeping a `.bak` of each file it replaces. It never downgrades an addon that's newer than the release, and leaves alone a copy you've edited locally. Add `--dry-run` to see what it would change first.
-
-> Use `@latest` the first time: releases older than 2.1.7 don't have the `update` command, and uvx may still have one of those cached.
+This updates the MCP server to the latest commit of this repo (refreshing uv's cached copy, or upgrading a `uv tool install`), pins your clients' entries for this fork to that commit, and updates every installed copy of the Blender addon, keeping a `.bak` of each file it replaces. It never downgrades an addon that's newer than the one it ships, and leaves alone a copy you've edited locally. Add `--dry-run` to see what it would change first.
 
 **2.** Restart your MCP client (Claude Desktop, Cursor, ...) so it starts the new server.
 
 **3.** In Blender: restart it, or **Preferences → Add-ons** → disable and re-enable **Interface: MCP for Blender**, then click **Start MCP Server** again.
 
-If a client is still set up with the old `blender-mcp` package name, `update` says so; `uvx mcp-for-blender setup` switches it over.
+If a client is still set up with the old `blender-mcp` package name, or runs upstream's package, `update` says so; `uvx --from git+https://github.com/JosueMFlores/mcp-for-blender mcp-for-blender setup` switches it over.
 
 > **Note:** the MCP server never modifies your Blender addon files on its own. When it starts, it checks whether the installed addon is behind the bundled copy and logs how to update; `update` and `install-addon` are what actually write. Trajectory capture still works on older loaded addons via an `execute_code` fallback.
 

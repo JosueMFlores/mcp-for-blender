@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import subprocess
 import types
 from pathlib import Path
 
@@ -14,7 +16,7 @@ from blender_mcp.addon_manager import (
     get_bundled_addon_path,
     update_installed_addons,
 )
-from blender_mcp.distribution import GIT_SOURCE, SOURCE_ENV
+from blender_mcp.distribution import GIT_SOURCE, REPO_URL, SOURCE_ENV
 from blender_mcp.setup_cli import OUTDATED, Client, ClientState
 from blender_mcp.update_cli import REEXEC_ENV, run_update, version_key
 
@@ -119,22 +121,38 @@ def _record_runs(monkeypatch, calls):
 
 # --- from PyPI ---------------------------------------------------------------
 
-def test_newer_release_reruns_from_it_through_uvx(pypi, monkeypatch):
+def test_pypi_hands_over_to_upstreams_update(pypi, monkeypatch, capsys):
     calls = []
-    monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.2.0", ""))
+    # This fork shares upstream's version numbers, so there's nothing to compare.
+    monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: pytest.fail("should not check PyPI"))
+    monkeypatch.setattr(update_cli, "update_installed_addons", lambda dry_run=False: pytest.fail("upstream's job"))
     monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
     monkeypatch.setattr(update_cli, "find_uv", lambda uvx: None)
-    monkeypatch.setattr(update_cli.subprocess, "run",
-                        lambda cmd, env=None, **kw: calls.append((cmd, env)) or types.SimpleNamespace(returncode=0))
+    _record_runs(monkeypatch, calls)
     assert run_update() == 0
     [(cmd, env)] = calls
-    assert cmd == ["/abs/uvx", "--refresh-package", "mcp-for-blender", "mcp-for-blender@2.2.0", "update"]
+    assert cmd == ["/abs/uvx", "--refresh-package", "mcp-for-blender", "mcp-for-blender@latest", "update"]
     assert env[REEXEC_ENV] == "2.1.0"
+    assert "Not running" not in capsys.readouterr().out
+
+
+def test_pypi_handover_points_clients_on_this_fork_at_its_setup(pypi, monkeypatch, capsys, tmp_path):
+    cursor = tmp_path / "mcp.json"
+    cursor.write_text(json.dumps({"mcpServers": {"blender": {"command": "uvx", "args": ["--from", GIT_SOURCE,
+                                                                                         "mcp-for-blender"]}}}))
+    monkeypatch.setattr(update_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    monkeypatch.setattr(update_cli, "find_uv", lambda uvx: None)
+    _record_runs(monkeypatch, [])
+    assert run_update() == 0
+    out = capsys.readouterr().out
+    assert f"Not running the server from PyPI yet: Cursor (runs mcp-for-blender from {GIT_SOURCE})" in out
+    # Upstream's setup can't move entries off this fork; this fork's can, told to use PyPI.
+    assert f"`BLENDER_MCP_SOURCE=pypi uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out
 
 
 def test_uv_tool_install_is_upgraded_first(pypi, monkeypatch):
     calls = []
-    monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.2.0", ""))
     monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
     monkeypatch.setattr(update_cli, "find_uv", lambda uvx: "/abs/uv")
     monkeypatch.setattr(update_cli, "uv_tool_installed", lambda uv: True)
@@ -145,14 +163,16 @@ def test_uv_tool_install_is_upgraded_first(pypi, monkeypatch):
     assert calls[1][0] == "/abs/uvx"
 
 
-def test_latest_release_updates_addon_without_rerunning(pypi, monkeypatch, capsys):
+def test_without_uvx_latest_release_updates_addon(pypi, monkeypatch, capsys):
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: None)
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: ("2.1.0", ""))
     monkeypatch.setattr(update_cli.subprocess, "run", lambda *a, **kw: pytest.fail("should not re-run"))
     assert run_update() == 0
     out = capsys.readouterr().out
     assert "Server source: PyPI" in out
     assert "2.1.0, the latest release" in out
-    assert "`uvx mcp-for-blender setup`" in out  # addon not installed → points at setup
+    # Addon not installed → points at setup, carrying the source.
+    assert f"`BLENDER_MCP_SOURCE=pypi uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out
 
 
 def test_rerun_does_not_check_pypi_again(pypi, monkeypatch, capsys):
@@ -165,6 +185,7 @@ def test_rerun_does_not_check_pypi_again(pypi, monkeypatch, capsys):
 
 
 def test_offline_still_updates_addon(pypi, monkeypatch, capsys):
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: None)
     monkeypatch.setattr(update_cli, "fetch_latest_version", lambda: (None, "no network"))
     assert run_update() == 0
     assert "couldn't check PyPI" in capsys.readouterr().out
@@ -248,17 +269,80 @@ def test_git_source_without_uvx_still_updates_addon(quiet, monkeypatch, capsys):
     monkeypatch.setattr(update_cli.subprocess, "run", lambda *a, **kw: pytest.fail("nothing to run"))
     assert run_update() == 0
     out = capsys.readouterr().out
-    assert f"Update the server with `pip install -U {GIT_SOURCE}`" in out
+    # pip would skip a same-version reinstall from the repo.
+    assert f"Update the server with `pip install --upgrade --force-reinstall {GIT_SOURCE}`" in out
     assert "Blender addon:" in out
     assert "Nothing to do" not in out
 
 
 def test_points_clients_on_another_source_at_setup(quiet, monkeypatch, capsys):
     monkeypatch.setenv(REEXEC_ENV, "2.1.0")
+    _answer_ls_remote(monkeypatch, [])
     monkeypatch.setattr(update_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json")])
     monkeypatch.setattr(update_cli, "client_state",
-                        lambda c: ClientState(OUTDATED, "blender", "runs mcp-for-blender from PyPI"))
+                        lambda c, target=None: ClientState(OUTDATED, "blender", "runs mcp-for-blender from PyPI"))
     assert run_update() == 0
     out = capsys.readouterr().out
     assert "Cursor (runs mcp-for-blender from PyPI)" in out
     assert f"`uvx --from {GIT_SOURCE} mcp-for-blender setup`" in out
+
+
+# --- moving pinned clients along ---------------------------------------------
+
+SHA = "1a2b3c4d5e6f" + "0" * 28
+OLD_ARGS = ["--from", f"{GIT_SOURCE}@{'9' * 40}", "mcp-for-blender"]
+
+
+def _answer_ls_remote(monkeypatch, calls, stdout=f"{SHA}\tHEAD\n", returncode=0, stderr=""):
+    """`git ls-remote` without the network; nothing else may run."""
+    def run(cmd, **kw):
+        assert cmd[:2] == ["git", "ls-remote"], f"unexpected command {cmd}"
+        calls.append(cmd)
+        return subprocess.CompletedProcess(cmd, returncode, stdout, stderr)
+
+    monkeypatch.setattr(update_cli.subprocess, "run", run)
+
+
+@pytest.fixture
+def pinned_cursor(quiet, monkeypatch, tmp_path):
+    """The re-run of update, with Cursor set up on an older commit of this fork."""
+    monkeypatch.setenv(REEXEC_ENV, "2.1.0")
+    monkeypatch.setattr(update_cli, "find_uvx", lambda: "/abs/uvx")
+    cursor = tmp_path / "mcp.json"
+    cursor.write_text(json.dumps({"mcpServers": {"blender": {"command": "/abs/uvx", "args": OLD_ARGS,
+                                                             "env": {"BLENDER_HOST": "studio-pc"}}}}))
+    monkeypatch.setattr(update_cli, "detect_clients", lambda: [Client("cursor", "Cursor", "json", cursor)])
+    return cursor
+
+
+def test_rerun_moves_pinned_clients_to_the_new_commit(pinned_cursor, monkeypatch, capsys):
+    calls = []
+    _answer_ls_remote(monkeypatch, calls)
+    assert run_update() == 0
+    assert calls == [["git", "ls-remote", REPO_URL, "HEAD"]]
+    assert json.loads(pinned_cursor.read_text())["mcpServers"]["blender"] == {
+        "command": "/abs/uvx", "args": ["--from", f"{GIT_SOURCE}@{SHA}", "mcp-for-blender"],
+        "env": {"BLENDER_HOST": "studio-pc"}}
+    out = capsys.readouterr().out
+    assert f"MCP clients (to commit {SHA[:12]}):" in out
+    assert f'✓ Cursor: Updated "blender" in {pinned_cursor}' in out
+    assert "Not running" not in out
+    assert "Restart your MCP clients" in out
+
+
+def test_rerun_dry_run_only_says_which_clients_it_would_move(pinned_cursor, monkeypatch, capsys):
+    before = pinned_cursor.read_text()
+    _answer_ls_remote(monkeypatch, [])
+    assert run_update(dry_run=True) == 0
+    assert pinned_cursor.read_text() == before
+    assert f'Cursor: would update "blender" in {pinned_cursor}' in capsys.readouterr().out
+
+
+def test_rerun_without_github_leaves_pinned_clients(pinned_cursor, monkeypatch, capsys):
+    before = pinned_cursor.read_text()
+    _answer_ls_remote(monkeypatch, [], stdout="", returncode=128, stderr="fatal: Could not resolve host: github.com\n")
+    assert run_update() == 0
+    assert pinned_cursor.read_text() == before
+    out = capsys.readouterr().out
+    assert "couldn't look up the latest commit (fatal: Could not resolve host: github.com)" in out
+    assert "Not running" not in out  # still this fork, just not the newest commit
