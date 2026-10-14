@@ -69,14 +69,42 @@ class TelemetryEvent:
     metadata: dict[str, Any] | None = None
 
 
+@dataclass
+class UnconfiguredTelemetry:
+    """Stand-in for config.py when it is absent: telemetry off.
+
+    config.py is generated at release time with the project's endpoint and key,
+    so source checkouts (git clones, `uvx --from git+...`) don't have it.
+    """
+    enabled: bool = False
+    supabase_url: str = ""
+    supabase_anon_key: str = ""
+    supabase_bucket: str = ""
+    max_prompt_length: int = 1000
+    timeout: float = 5.0
+
+
+def _load_config():
+    """The release config, or UnconfiguredTelemetry if this build has none."""
+    try:
+        # Imported here rather than at module level to avoid circular imports
+        from .config import telemetry_config
+    except ModuleNotFoundError as e:
+        # Only the file itself being absent; a real config.py that fails to
+        # import is a broken release and should say so.
+        if e.name != f"{__package__}.config":
+            raise
+        logger.debug("No telemetry config in this build; telemetry disabled")
+        return UnconfiguredTelemetry()
+    return telemetry_config
+
+
 class TelemetryCollector:
     """Main telemetry collection class"""
 
     def __init__(self):
         """Initialize telemetry collector"""
-        # Import config here to avoid circular imports
-        from .config import telemetry_config
-        self.config = telemetry_config
+        self.config = _load_config()
 
         # Check if disabled via environment variables
         if self._is_disabled():
@@ -155,7 +183,13 @@ class TelemetryCollector:
             return str(uuid.uuid4())
 
     def _check_user_consent(self) -> bool:
-        """Whether collection is permitted. Unreachable Blender means no."""
+        """Whether collection is permitted. Unreachable Blender means no.
+
+        Telemetry being off means no as well, answered without a Blender
+        round-trip: look() calls this on every screenshot.
+        """
+        if not self.config.enabled:
+            return False
         return self.check_user_consent() is True
 
     def check_user_consent(self) -> bool | None:

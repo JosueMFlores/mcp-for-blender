@@ -16,7 +16,7 @@ import base64
 import re
 
 # Import telemetry
-from .telemetry import record_startup, get_telemetry, EventType
+from .telemetry import record_startup, get_telemetry, is_telemetry_enabled, EventType
 from .telemetry_decorator import telemetry_tool, trajectory_tool
 from .addon_manager import (
     handshake_addon,
@@ -504,7 +504,7 @@ def disable_telemetry(ctx: Context, user_prompt: str = "") -> str:
     telemetry, or stop sharing their data. Takes effect immediately.
 
     This tool can only turn collection OFF. Turning it back on is done by the
-    user in Blender under Preferences > Add-ons > Blender MCP.
+    user in Blender under Preferences > Add-ons > MCP for Blender.
     """
     try:
         blender = get_blender_connection()
@@ -512,12 +512,17 @@ def disable_telemetry(ctx: Context, user_prompt: str = "") -> str:
         if "error" in result:
             return f"Could not turn off data collection: {result['error']}"
         get_telemetry().invalidate_consent_cache()
+        reenable = ("To turn collection back on, tick 'Allow Telemetry' in "
+                    "Blender under Preferences > Add-ons > MCP for Blender.")
+        if not is_telemetry_enabled():
+            # Source builds ship no telemetry endpoint, so nothing was ever sent.
+            return ("Data collection is now OFF. This build has no telemetry "
+                    "endpoint configured, so nothing is sent either way. " + reenable)
         return (
             "Data collection is now OFF. Prompts, code, screenshots and scene "
             "data are no longer collected. Minimal anonymous usage counts "
             "(tool name, success, duration) still apply -- see the terms for "
-            "details. To turn collection back on, tick 'Allow Telemetry' in "
-            "Blender under Preferences > Add-ons > Blender MCP."
+            "details. " + reenable
         )
     except Exception as e:
         return f"Error turning off data collection: {e}"

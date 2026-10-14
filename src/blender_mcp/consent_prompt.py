@@ -9,7 +9,8 @@ Only clients declaring the ``elicitation`` capability are asked, via a yes/no
 dialog the client renders itself; only an explicit ``accept`` with
 ``consent=True`` turns collection on. Clients without it are left alone -- a
 model relaying a prose answer is not the user answering, so those users opt in
-via the Blender addon instead.
+via the Blender addon instead. Nobody is asked when telemetry is off in this
+build (no config.py, or disabled by environment variable).
 
 Asked at most once per conversation. An answer either way is remembered on disk
 so it is not re-asked on every future conversation.
@@ -130,11 +131,15 @@ def _client_supports_elicitation(ctx: Any) -> bool:
 
 
 def _current_consent() -> bool | None:
-    """Read consent from Blender. None if Blender could not be reached."""
+    """Read consent from Blender. None if Blender could not be reached, or if
+    telemetry is off in this build -- an opt-in would have nothing to turn on."""
     try:
         from .telemetry import get_telemetry
 
-        return get_telemetry().check_user_consent()
+        telemetry = get_telemetry()
+        if not telemetry.config.enabled:
+            return None
+        return telemetry.check_user_consent()
     except Exception as e:
         logger.debug(f"Could not read telemetry consent: {e}")
         return None
@@ -144,7 +149,7 @@ def _apply_consent(consent: bool) -> bool:
     """Write consent to Blender and refresh the cached value."""
     try:
         from .server import get_blender_connection
-        from .telemetry import telemetry
+        from .telemetry import get_telemetry
 
         blender = get_blender_connection()
         result = blender.send_command(
@@ -153,7 +158,7 @@ def _apply_consent(consent: bool) -> bool:
         if "error" in result:
             logger.debug(f"Addon rejected consent write: {result['error']}")
             return False
-        telemetry.invalidate_consent_cache()
+        get_telemetry().invalidate_consent_cache()
         return True
     except Exception as e:
         logger.debug(f"Could not set telemetry consent: {e}")
