@@ -39,7 +39,7 @@ bl_info = {
 }
 
 # Keep in sync with blender_mcp.addon_manager.EXPECTED_ADDON_PROTOCOL_VERSION.
-ADDON_PROTOCOL_VERSION = 13
+ADDON_PROTOCOL_VERSION = 14
 
 # Per-snapshot object cap for get_world_state_snapshot. Keep in sync with
 # blender_mcp.trajectory.MAX_SNAPSHOT_OBJECTS.
@@ -1178,6 +1178,164 @@ def _object_detail(obj):
     if obj.users_collection:
         detail += f" in collection '{obj.users_collection[0].name}'"
     return detail
+
+
+EXPORT_PRESETS = ("roblox",)
+
+# FBX for Roblox Studio's 3D Importer, as Roblox's Blender export docs set it:
+# textures embedded, no leaf bones, only the assigned action baked. 0.01 with
+# the scene unit scale ignored writes 1 Blender unit as 1 FBX centimetre, which
+# Studio reads as 1 stud, in a default metre scene and in Roblox's centimetre
+# setup alike. A character faces -Y in Blender.
+ROBLOX_FBX_SETTINGS = {
+    "global_scale": 0.01, "apply_unit_scale": False, "apply_scale_options": 'FBX_SCALE_NONE',
+    "axis_forward": '-Z', "axis_up": 'Y', "bake_space_transform": False,
+    "object_types": {'EMPTY', 'ARMATURE', 'MESH'}, "use_custom_props": True, "add_leaf_bones": False,
+    "path_mode": 'COPY', "embed_textures": True,
+    "bake_anim_use_all_bones": True, "bake_anim_use_nla_strips": False, "bake_anim_use_all_actions": False,
+    "bake_anim_force_startend_keying": False, "bake_anim_simplify_factor": 0.0,
+}
+# Limits from create.roblox.com/docs/art/modeling/specifications.
+ROBLOX_MAX_TRIANGLES = 20000  # per mesh
+ROBLOX_MAX_INFLUENCES = 4  # bones per vertex
+# Roblox's standard texture map size. Avatar Marketplace items take up to 2048;
+# larger images are downscaled.
+ROBLOX_TEXTURE_SIZE = 1024
+R15_BONES = (
+    "HumanoidRootNode", "LowerTorso", "UpperTorso", "Head",
+    "LeftUpperArm", "LeftLowerArm", "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
+    "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightUpperLeg", "RightLowerLeg", "RightFoot",
+)
+
+
+def _export_path(filepath, fmt):
+    """(absolute path with the format's extension, None) or (None, error).
+
+    // is the saved .blend's folder. Other relative paths would land in
+    Blender's working directory, which nobody can predict, so they're refused.
+    """
+    if filepath.startswith("//"):
+        if not bpy.data.filepath:
+            return None, "// means the .blend's folder, but this .blend isn't saved. Save it or use an absolute path."
+        filepath = bpy.path.abspath(filepath)
+    filepath = os.path.expanduser(filepath)
+    if not os.path.isabs(filepath):
+        return None, f"filepath must be absolute or start with // (the .blend's folder), got '{filepath}'"
+    root, ext = os.path.splitext(filepath)
+    if ext.lower() != "." + fmt and ext.lower() in ("", ".glb", ".gltf", ".fbx"):
+        filepath = root + "." + fmt
+    return os.path.normpath(filepath), None
+
+
+def _restore_selection(selected, active, mode):
+    """Put back the selection, active object and mode an export changed."""
+    with suppress(Exception):
+        bpy.ops.object.select_all(action='DESELECT')
+    for obj in selected:
+        with suppress(Exception):  # deleted or hidden meanwhile
+            obj.select_set(True)
+    with suppress(Exception):
+        bpy.context.view_layer.objects.active = active
+    if active is not None and mode != 'OBJECT':
+        with suppress(Exception):
+            bpy.ops.object.mode_set(mode=mode)
+
+
+def _name_list(names, limit=8):
+    shown = ", ".join(names[:limit])
+    return shown + (f" and {len(names) - limit} more" if len(names) > limit else "")
+
+
+def _transform_frozen(obj):
+    _location, rotation, scale = obj.matrix_world.decompose()
+    return abs(abs(rotation.w) - 1.0) < 1e-6 and all(abs(s - 1.0) < 1e-4 for s in scale)
+
+
+def _over_influenced_vertices(obj):
+    """Vertices weighted to more bones of the mesh's armature than Roblox allows."""
+    arm = next((m.object for m in obj.modifiers if m.type == 'ARMATURE' and m.object), None)
+    if arm is None or arm.type != 'ARMATURE':
+        return 0
+    bones = {b.name for b in arm.data.bones}
+    deform = {g.index for g in obj.vertex_groups if g.name in bones}
+    if len(deform) <= ROBLOX_MAX_INFLUENCES:
+        return 0
+    return sum(1 for v in obj.data.vertices
+               if sum(1 for g in v.groups if g.group in deform and g.weight > 0) > ROBLOX_MAX_INFLUENCES)
+
+
+def _roblox_warnings(objects, depsgraph=None):
+    """What in the exported objects Roblox Studio rejects or imports wrong, in plain words.
+
+    Counts stay cheap: triangles come from loop and polygon totals, and the
+    per-vertex weight scan skips meshes already over the triangle limit.
+    """
+    warnings, unfrozen, no_uv, materials = [], [], [], {}
+    for obj in objects:
+        # _Att meshes become Attachments in Studio, not geometry, and may carry an orientation.
+        if obj.type not in ('MESH', 'ARMATURE') or re.sub(r"\.\d{3}$", "", obj.name).endswith("_Att"):
+            continue
+        if not _transform_frozen(obj):
+            unfrozen.append(obj.name)
+        if obj.type == 'ARMATURE':
+            bones = {b.name for b in obj.data.bones}
+            missing = [b for b in R15_BONES if b not in bones]
+            if len(missing) == len(R15_BONES):
+                warnings.append(f"Armature '{obj.name}' has no R15 bone names. Fine for a custom rig, but an R15 "
+                                f"character needs {', '.join(R15_BONES)}.")
+            elif missing:
+                warnings.append(f"Armature '{obj.name}' is missing R15 bones: {', '.join(missing)}.")
+            continue
+        mesh = obj.data
+        if depsgraph is not None:
+            with suppress(Exception):
+                mesh = obj.evaluated_get(depsgraph).data
+        triangles = len(mesh.loops) - 2 * len(mesh.polygons)
+        if triangles > ROBLOX_MAX_TRIANGLES:
+            warnings.append(f"'{obj.name}' has {triangles:,} triangles; Roblox rejects meshes over "
+                            f"{ROBLOX_MAX_TRIANGLES:,}. Decimate it or split it into parts.")
+        else:
+            heavy = _over_influenced_vertices(obj)
+            if heavy:
+                warnings.append(f"'{obj.name}' has {heavy:,} vertices weighted to more than {ROBLOX_MAX_INFLUENCES} "
+                                f"bones, Roblox's limit. Weight Paint > Weights > Limit Total, then Normalize All.")
+        if not obj.data.uv_layers:
+            no_uv.append(obj.name)
+        for slot in obj.material_slots:
+            if slot.material is not None:
+                materials[slot.material.name] = slot.material
+
+    images, indirect = {}, []
+    for mat in materials.values():
+        tree = getattr(mat, "node_tree", None)
+        for node in (tree.nodes if tree is not None else ()):
+            if node.type == 'TEX_IMAGE' and node.image is not None:
+                images[node.image.name] = node.image
+            elif node.type == 'BSDF_PRINCIPLED':
+                base = node.inputs.get("Base Color")
+                if base is not None and base.is_linked and base.links[0].from_node.type != 'TEX_IMAGE':
+                    indirect.append(mat.name)
+    no_file = []
+    for image in images.values():
+        width, height = image.size[0], image.size[1]
+        if max(width, height) > ROBLOX_TEXTURE_SIZE:
+            warnings.append(f"Image '{image.name}' is {width}x{height}. Roblox textures are {ROBLOX_TEXTURE_SIZE}x"
+                            f"{ROBLOX_TEXTURE_SIZE} (2048 for avatar Marketplace items); larger ones get downscaled.")
+        if not image.filepath:
+            no_file.append(image.name)
+
+    if unfrozen:
+        warnings.append(f"Unapplied rotation or scale on {_name_list(unfrozen)}. Roblox wants frozen transforms: "
+                        "Ctrl+A > Rotation & Scale (a character's armature also belongs at the origin).")
+    if no_uv:
+        warnings.append(f"No UV map on {_name_list(no_uv)}, so Roblox can't put a texture on them.")
+    if indirect:
+        warnings.append(f"Base Color isn't an Image Texture plugged straight in on {_name_list(indirect)}, so the FBX "
+                        "carries no color texture for them. Connect the image directly, or bake to one.")
+    if no_file:
+        warnings.append(f"Images with no file on disk: {_name_list(no_file)}. Save them as PNG files; otherwise the "
+                        "FBX can lose them and the part imports grey.")
+    return warnings
 
 
 class BlenderMCPServer:
@@ -2566,7 +2724,8 @@ class BlenderMCPServer:
             "did_you_mean": [name for name in available if member_name.lower() in name.lower()][:15],
         }
 
-    def export_scene(self, filepath, format="glb", object_names=None, selection_only=False, apply_modifiers=True):
+    def export_scene(self, filepath, format="glb", object_names=None, selection_only=False, apply_modifiers=True,
+                     preset=None):
         """Export the whole scene, the current selection, or the named objects to a GLB or FBX file.
 
         Named objects are exported together with their children. GLB carries PBR
@@ -2574,65 +2733,108 @@ class BlenderMCPServer:
         tools that need Unity's built-in importer. apply_modifiers=False keeps rigs
         and shape keys intact. The file is written where the caller asked, so other
         applications (game engines, viewers) can pick it up without going through
-        execute_code.
+        execute_code. A path starting with // is relative to the saved .blend.
+
+        preset="roblox" forces FBX with Roblox Studio's import settings and adds
+        "warnings": what in the exported objects Roblox would reject or import
+        wrong. The user's selection, active object and mode are put back afterwards.
         """
         if not filepath:
             return {"error": "filepath is required"}
-        fmt = (format or "glb").lower()
+        preset = (preset or "").strip().lower() or None
+        if preset is not None and preset not in EXPORT_PRESETS:
+            return {"error": f"Unknown preset '{preset}'. Valid presets: {', '.join(EXPORT_PRESETS)}"}
+        fmt = "fbx" if preset == "roblox" else (format or "glb").lower()
         if fmt not in ("glb", "fbx"):
             return {"error": f"format must be glb or fbx, got '{format}'"}
+        filepath, error = _export_path(filepath, fmt)
+        if error:
+            return {"error": error}
 
         names = [n for n in (object_names or []) if n]
-        use_selection = False
-        exported = []
         if names:
             missing = [n for n in names if bpy.data.objects.get(n) is None]
             if missing:
                 return {"error": "Objects not found in Blender: " + ", ".join(missing)}
-            bpy.ops.object.select_all(action='DESELECT')
+            targets, seen = [], set()
             for n in names:
                 obj = bpy.data.objects[n]
                 for o in [obj, *obj.children_recursive]:
-                    o.select_set(True)
-                    if o.name not in exported:
-                        exported.append(o.name)
-            bpy.context.view_layer.objects.active = bpy.data.objects[names[0]]
+                    if o.name not in seen:
+                        seen.add(o.name)
+                        targets.append(o)
             use_selection = True
         elif selection_only:
-            if not bpy.context.selected_objects:
+            targets = list(bpy.context.selected_objects)
+            if not targets:
                 return {"error": "Nothing is selected in Blender and no object_names were given"}
-            exported = [o.name for o in bpy.context.selected_objects]
             use_selection = True
         else:
-            exported = [o.name for o in bpy.context.scene.objects]
+            targets = list(bpy.context.scene.objects)
+            use_selection = False
 
+        view_layer = bpy.context.view_layer
+        selected, active = list(bpy.context.selected_objects), view_layer.objects.active
+        mode = getattr(active, "mode", 'OBJECT') if active is not None else 'OBJECT'
+        warnings = []
         try:
-            if bpy.context.object and getattr(bpy.context.object, "mode", 'OBJECT') != 'OBJECT':
-                bpy.ops.object.mode_set(mode='OBJECT')
-        except Exception:
-            pass
+            # Exporters read object data, which edit and sculpt mode only write back on exit.
+            if mode != 'OBJECT':
+                with suppress(Exception):
+                    bpy.ops.object.mode_set(mode='OBJECT')
+            if names:
+                bpy.ops.object.select_all(action='DESELECT')
+                for o in targets:
+                    o.select_set(True)
+                view_layer.objects.active = bpy.data.objects[names[0]]
 
-        directory = os.path.dirname(filepath)
-        if directory:
-            os.makedirs(directory, exist_ok=True)
+            directory = os.path.dirname(filepath)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
 
-        if fmt == "glb":
-            bpy.ops.export_scene.gltf(
-                filepath=filepath, export_format='GLB', use_selection=use_selection,
-                use_active_scene=True, export_apply=apply_modifiers,
-                export_animations=True, export_skins=True, export_morph=True, export_yup=True)
-        else:
-            bpy.ops.export_scene.fbx(
-                filepath=filepath, use_selection=use_selection, apply_unit_scale=True,
-                bake_space_transform=apply_modifiers, use_mesh_modifiers=apply_modifiers,
-                path_mode='COPY', embed_textures=True)
+            if preset == "roblox":
+                targets = [o for o in targets if o.type in ROBLOX_FBX_SETTINGS["object_types"]]
+                if use_selection:
+                    # Hidden objects, or ones in a hidden collection, can't be selected,
+                    # so the exporter leaves them out.
+                    skipped = [o.name for o in targets if not o.select_get()]
+                    if skipped:
+                        targets = [o for o in targets if o.name not in skipped]
+                        warnings.append(f"Left out because hidden or unselectable: {_name_list(skipped)}. "
+                                        "Unhide them, and their collections, to include them.")
+                # Roblox's docs: bake animation only for content that has keyframes.
+                animated = any(getattr(getattr(o, "animation_data", None), "action", None) for o in targets)
+                bpy.ops.export_scene.fbx(
+                    filepath=filepath, use_selection=use_selection, use_mesh_modifiers=apply_modifiers,
+                    bake_anim=animated, **ROBLOX_FBX_SETTINGS)
+                depsgraph = None
+                if apply_modifiers:
+                    with suppress(Exception):
+                        depsgraph = bpy.context.evaluated_depsgraph_get()
+                warnings += _roblox_warnings(targets, depsgraph)
+            elif fmt == "glb":
+                bpy.ops.export_scene.gltf(
+                    filepath=filepath, export_format='GLB', use_selection=use_selection,
+                    use_active_scene=True, export_apply=apply_modifiers,
+                    export_animations=True, export_skins=True, export_morph=True, export_yup=True)
+            else:
+                bpy.ops.export_scene.fbx(
+                    filepath=filepath, use_selection=use_selection, apply_unit_scale=True,
+                    bake_space_transform=apply_modifiers, use_mesh_modifiers=apply_modifiers,
+                    path_mode='COPY', embed_textures=True)
+        finally:
+            _restore_selection(selected, active, mode)
 
-        return {
+        result = {
             "path": filepath,
             "bytes": os.path.getsize(filepath),
             "selection_only": use_selection,
-            "exported": exported,
+            "exported": [o.name for o in targets],
         }
+        if preset:
+            result["preset"] = preset
+            result["warnings"] = warnings
+        return result
 
     def get_polyhaven_categories(self, asset_type):
         """Get the category taxonomy and attribute schema for an asset type."""

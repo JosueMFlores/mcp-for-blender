@@ -9,14 +9,48 @@ import types
 from conftest import ROOT_ADDON as ADDON
 
 
+class _Matrix:
+    """matrix_world with only what decompose() reports: rotation w and scale."""
+
+    def __init__(self, w=1.0, scale=(1.0, 1.0, 1.0)):
+        self.w, self.scale = w, scale
+
+    def decompose(self):
+        return (0.0, 0.0, 0.0), types.SimpleNamespace(w=self.w), self.scale
+
+
+def _mesh(triangles=12, uv=True, vertices=()):
+    return types.SimpleNamespace(loops=[None] * (3 * triangles), polygons=[None] * triangles,
+                                 uv_layers=["UVMap"] if uv else [], vertices=list(vertices))
+
+
+def _armature_data(bones):
+    return types.SimpleNamespace(bones=[types.SimpleNamespace(name=b) for b in bones])
+
+
 class _Object:
-    def __init__(self, name, children=()):
+    def __init__(self, name, children=(), type="MESH", data=None, matrix=None, mode="OBJECT", materials=(),
+                 modifiers=(), vertex_groups=(), action=None, selectable=True):
         self.name = name
         self.children_recursive = list(children)
         self.selected = False
+        self.type = type
+        self.data = data if data is not None else (_mesh() if type == "MESH" else None)
+        self.matrix_world = matrix or _Matrix()
+        self.mode = mode
+        self.material_slots = [types.SimpleNamespace(material=m) for m in materials]
+        self.modifiers = list(modifiers)
+        self.vertex_groups = list(vertex_groups)
+        self.animation_data = types.SimpleNamespace(action=action) if action else None
+        self.selectable = selectable
 
     def select_set(self, value):
-        self.selected = value
+        # Like Blender, hidden objects silently stay unselected.
+        if self.selectable or not value:
+            self.selected = value
+
+    def select_get(self):
+        return self.selected
 
 
 class _Objects:
@@ -34,7 +68,7 @@ class _Objects:
         return iter(self._all)
 
 
-def _load_addon(monkeypatch, objects, selected, exports):
+def _load_addon(monkeypatch, objects, selected, exports, active=None, blend="", mode_calls=None):
     scene = types.SimpleNamespace(
         blendermcp_use_polyhaven=False,
         blendermcp_use_hyper3d=False,
@@ -48,9 +82,10 @@ def _load_addon(monkeypatch, objects, selected, exports):
         scene=scene,
         object=None,
         selected_objects=selected,
-        view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=None)),
+        view_layer=types.SimpleNamespace(objects=types.SimpleNamespace(active=active)),
     )
-    bpy.data = types.SimpleNamespace(objects=objects)
+    bpy.data = types.SimpleNamespace(objects=objects, filepath=blend)
+    bpy.path = types.SimpleNamespace(abspath=lambda p: os.path.join(os.path.dirname(blend), p[2:]))
     bpy.types = types.SimpleNamespace(
         AddonPreferences=object,
         Operator=object,
@@ -60,13 +95,24 @@ def _load_addon(monkeypatch, objects, selected, exports):
 
     def export(kind):
         def _op(filepath, **kwargs):
-            exports.append({"kind": kind, "filepath": filepath, **kwargs})
+            selection = [o.name for o in objects if o.selected]
+            exports.append({"kind": kind, "filepath": filepath, "selected": selection, **kwargs})
             with open(filepath, "wb") as fh:
                 fh.write(b"EXPORTED")
         return _op
 
+    def select_all(action):
+        if action == "DESELECT":
+            for o in objects:
+                o.select_set(False)
+
+    def mode_set(mode):
+        (mode_calls if mode_calls is not None else []).append(mode)
+        if bpy.context.view_layer.objects.active is not None:
+            bpy.context.view_layer.objects.active.mode = mode
+
     bpy.ops = types.SimpleNamespace(
-        object=types.SimpleNamespace(select_all=lambda action: None, mode_set=lambda mode: None),
+        object=types.SimpleNamespace(select_all=select_all, mode_set=mode_set),
         export_scene=types.SimpleNamespace(gltf=export("gltf"), fbx=export("fbx")),
     )
 
@@ -121,7 +167,8 @@ def test_named_objects_export_with_their_children_as_glb(monkeypatch, tmp_path):
     result = addon.BlenderMCPServer().export_scene(out, object_names=["Chair"])
 
     assert result == {"path": out, "bytes": len(b"EXPORTED"), "selection_only": True, "exported": ["Chair", "Leg"]}
-    assert chair.selected and leg.selected and not lamp.selected
+    assert exports[0]["selected"] == ["Chair", "Leg"]
+    assert not (chair.selected or leg.selected or lamp.selected), "the user's (empty) selection is back"
     assert exports[0]["kind"] == "gltf"
     assert exports[0]["use_selection"] is True
     assert exports[0]["use_active_scene"] is True
@@ -181,3 +228,151 @@ def test_command_is_always_routed(monkeypatch, tmp_path):
 
     assert command["status"] == "success"
     assert command["result"]["exported"] == ["A"]
+
+
+R15 = ["HumanoidRootNode", "LowerTorso", "UpperTorso", "Head",
+       "LeftUpperArm", "LeftLowerArm", "LeftHand", "RightUpperArm", "RightLowerArm", "RightHand",
+       "LeftUpperLeg", "LeftLowerLeg", "LeftFoot", "RightUpperLeg", "RightLowerLeg", "RightFoot"]
+
+
+def _image(name, size=(1024, 1024), filepath="//textures/x.png"):
+    return types.SimpleNamespace(name=name, size=size, filepath=filepath)
+
+
+def _material(name, image=None, base_color_from=None):
+    nodes = []
+    if image is not None:
+        nodes.append(types.SimpleNamespace(type="TEX_IMAGE", image=image))
+    link = [types.SimpleNamespace(from_node=types.SimpleNamespace(type=base_color_from))] if base_color_from else []
+    nodes.append(types.SimpleNamespace(type="BSDF_PRINCIPLED", inputs={
+        "Base Color": types.SimpleNamespace(is_linked=bool(link), links=link)}))
+    return types.SimpleNamespace(name=name, node_tree=types.SimpleNamespace(nodes=nodes))
+
+
+def test_roblox_preset_forces_fbx_with_studio_settings(monkeypatch, tmp_path):
+    rig = _Object("Root", type="ARMATURE", data=_armature_data(R15))
+    body = _Object("Head_Geo", materials=[_material("Skin", _image("skin.png"), "TEX_IMAGE")])
+    character = _Object("Character", type="EMPTY", data=None, children=[rig, body])
+    camera = _Object("Camera", type="CAMERA")
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(character, rig, body, camera), [], exports)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "char.glb"), object_names=["Character"],
+                                                   preset="Roblox")
+
+    assert result["path"] == str(tmp_path / "char.fbx"), "the preset's format decides the extension"
+    assert result["preset"] == "roblox"
+    assert result["warnings"] == []
+    assert result["exported"] == ["Character", "Root", "Head_Geo"], "cameras and lights aren't exported"
+    kwargs = exports[0]
+    assert kwargs["kind"] == "fbx"
+    assert kwargs["global_scale"] == 0.01 and kwargs["apply_unit_scale"] is False
+    assert (kwargs["axis_forward"], kwargs["axis_up"]) == ("-Z", "Y")
+    assert kwargs["object_types"] == {"EMPTY", "ARMATURE", "MESH"}
+    assert kwargs["add_leaf_bones"] is False and kwargs["bake_space_transform"] is False
+    assert kwargs["path_mode"] == "COPY" and kwargs["embed_textures"] is True
+    assert kwargs["use_custom_props"] is True and kwargs["use_mesh_modifiers"] is True
+    assert kwargs["bake_anim"] is False, "nothing is animated"
+    assert not kwargs["bake_anim_use_nla_strips"] and not kwargs["bake_anim_use_all_actions"]
+    assert not kwargs["bake_anim_force_startend_keying"] and kwargs["bake_anim_simplify_factor"] == 0.0
+
+
+def test_roblox_preset_bakes_animation_only_when_there_is_an_action(monkeypatch, tmp_path):
+    rig = _Object("Root", type="ARMATURE", data=_armature_data(R15), action=object())
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(rig), [], exports)
+
+    addon.BlenderMCPServer().export_scene(str(tmp_path / "walk.fbx"), preset="roblox")
+
+    assert exports[0]["bake_anim"] is True
+
+
+def test_roblox_warnings_name_what_studio_would_reject(monkeypatch, tmp_path):
+    rig = _Object("Rig", type="ARMATURE", data=_armature_data(["HumanoidRootNode", "LowerTorso", "Spine"]))
+    groups = [types.SimpleNamespace(index=i, name=b) for i, b in enumerate(R15[:6])]
+    five_bones = types.SimpleNamespace(groups=[types.SimpleNamespace(group=i, weight=0.2) for i in range(5)])
+    heavy_rig = _Object("BodyRig", type="ARMATURE", data=_armature_data(R15))
+    skinned = _Object("Body", data=_mesh(vertices=[five_bones]), vertex_groups=groups,
+                      modifiers=[types.SimpleNamespace(type="ARMATURE", object=heavy_rig)])
+    dense = _Object("Statue", data=_mesh(triangles=20001))
+    scaled = _Object("Crate", matrix=_Matrix(scale=(2.0, 2.0, 2.0)),
+                     materials=[_material("Wood", _image("wood.png", size=(2048, 2048)))])
+    flat = _Object("Sign", data=_mesh(uv=False),
+                   materials=[_material("Paint", _image("Generated", filepath=""), "MIX")])
+    attachment = _Object("Hat_Att", data=_mesh(triangles=0, uv=False), matrix=_Matrix(w=0.7))
+    hidden = _Object("Cage", selectable=False)
+    top = _Object("Character", type="EMPTY", data=None,
+                  children=[rig, heavy_rig, skinned, dense, scaled, flat, attachment, hidden])
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(top, rig, heavy_rig, skinned, dense, scaled, flat, attachment,
+                                              hidden), [], exports)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "c.fbx"), object_names=["Character"],
+                                                   preset="roblox")
+    text = "\n".join(result["warnings"])
+
+    assert "'Statue' has 20,001 triangles" in text and "20,000" in text
+    assert "'Body' has 1 vertices weighted to more than 4 bones" in text
+    assert "'Rig' is missing R15 bones" in text and "UpperTorso" in text
+    assert "rotation or scale on Crate" in text
+    assert "No UV map on Sign" in text and "Hat_Att" not in text
+    assert "'wood.png' is 2048x2048" in text
+    assert "Base Color isn't an Image Texture plugged straight in on Paint" in text
+    assert "no file on disk: Generated" in text
+    assert "hidden or unselectable: Cage" in text and "Cage" not in result["exported"]
+
+
+def test_unknown_preset_lists_the_valid_ones(monkeypatch, tmp_path):
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(_Object("A")), [], exports)
+
+    result = addon.BlenderMCPServer().export_scene(str(tmp_path / "a.fbx"), preset="unreal")
+
+    assert "unreal" in result["error"] and "roblox" in result["error"]
+    assert exports == []
+
+
+def test_paths_are_absolute_or_relative_to_the_blend(monkeypatch, tmp_path):
+    exports = []
+    addon = _load_addon(monkeypatch, _Objects(_Object("A")), [], exports, blend=str(tmp_path / "proj.blend"))
+    server = addon.BlenderMCPServer()
+
+    assert "absolute" in server.export_scene("out/a.glb")["error"]
+    result = server.export_scene("//export/a.glb")
+    assert result["path"] == str(tmp_path / "export" / "a.glb")
+
+    unsaved = _load_addon(monkeypatch, _Objects(_Object("A")), [], [])
+    assert "isn't saved" in unsaved.BlenderMCPServer().export_scene("//a.glb")["error"]
+
+
+def test_selection_active_object_and_mode_are_put_back(monkeypatch, tmp_path):
+    chair = _Object("Chair")
+    lamp = _Object("Lamp", mode="EDIT")
+    lamp.selected = True
+    exports, modes = [], []
+    addon = _load_addon(monkeypatch, _Objects(chair, lamp), [lamp], exports, active=lamp, mode_calls=modes)
+
+    addon.BlenderMCPServer().export_scene(str(tmp_path / "chair.fbx"), object_names=["Chair"], preset="roblox")
+
+    assert exports[0]["selected"] == ["Chair"]
+    assert lamp.selected and not chair.selected
+    assert addon.bpy.context.view_layer.objects.active is lamp
+    assert modes == ["OBJECT", "EDIT"], "left edit mode to export, then went back"
+
+
+def test_selection_is_put_back_when_the_export_fails(monkeypatch, tmp_path):
+    chair = _Object("Chair")
+    lamp = _Object("Lamp")
+    lamp.selected = True
+    addon = _load_addon(monkeypatch, _Objects(chair, lamp), [lamp], [], active=lamp)
+
+    def broken(**_kwargs):
+        raise RuntimeError("disk full")
+
+    addon.bpy.ops.export_scene.gltf = broken
+    try:
+        addon.BlenderMCPServer().export_scene(str(tmp_path / "chair.glb"), object_names=["Chair"])
+    except RuntimeError:
+        pass
+    assert lamp.selected and not chair.selected
+    assert addon.bpy.context.view_layer.objects.active is lamp

@@ -22,7 +22,7 @@ from .distribution import uvx_command
 logger = logging.getLogger("BlenderMCPServer")
 
 # Must match ADDON_PROTOCOL_VERSION in addon.py / bundled/addon.py
-EXPECTED_ADDON_PROTOCOL_VERSION = 13
+EXPECTED_ADDON_PROTOCOL_VERSION = 14
 
 _ADDON_MARKER = 'bl_info = {\n    "name": "MCP for Blender"'
 _INSTALLED_FILENAME = "blender_mcp.py"

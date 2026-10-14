@@ -42,3 +42,8 @@ def test_instructions_do_not_point_at_an_unreachable_prompt():
 
 def test_instructions_send_the_model_to_look():
     assert "look" in SERVER_INSTRUCTIONS
+
+
+def test_instructions_point_to_guides_and_export():
+    assert "get_guide" in SERVER_INSTRUCTIONS and "Roblox" in SERVER_INSTRUCTIONS
+    assert "export_scene" in SERVER_INSTRUCTIONS

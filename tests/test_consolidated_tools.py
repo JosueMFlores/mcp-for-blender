@@ -10,6 +10,7 @@ from blender_mcp.openai_apps import is_app_only
 MODEL_TOOLS = {
     "get_addon_status", "disable_telemetry", "get_scene_info", "execute_blender_code",
     "record_trajectory_feedback", "look", "generate_3d", "search_assets", "import_asset",
+    "export_scene", "get_guide",
 }
 
 
@@ -20,15 +21,18 @@ def test_model_sees_only_the_consolidated_tools():
 
 def test_every_guide_has_a_title_summary_and_body():
     found = guides.all_guides()
-    assert {"bpy", "scene", "level-design", "animation", "rigging", "retopology", "materials"} <= set(found)
+    assert {"bpy", "scene", "level-design", "animation", "rigging", "retopology", "materials", "roblox"} <= set(found)
     for guide in found.values():
         assert guide.title and guide.summary and guide.body.startswith("# ")
 
 
-def test_guides_are_off_for_now():
-    tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
+def test_guides_are_a_tool_and_resources():
+    tools = {t.name: t for t in asyncio.run(server.mcp.list_tools())}
     uris = {str(r.uri) for r in asyncio.run(server.mcp.list_resources())}
-    assert "get_guide" not in tools and not any(u.startswith("guide://") for u in uris)
+    assert {f"guide://{topic}" for topic in guides.all_guides()} <= uris
+    assert "- roblox:" in tools["get_guide"].description
+    assert server.get_guide("Roblox").startswith("# Roblox")
+    assert "No guide called" in server.get_guide("unity")
 
 
 def test_scripts_compile_and_never_raise_systemexit():
@@ -187,3 +191,54 @@ def test_look_caption_for_images():
     assert server._look_caption({"mode": "image", "image": "Render Result", "original_size": [1920, 1080],
                                  "width": 768, "height": 432}) == \
         "Image 'Render Result', 1920x1080, shown at 768x432."
+
+
+def test_export_scene_reports_path_objects_and_roblox_warnings(monkeypatch):
+    blender = _Blender({"export_scene": {
+        "path": "/tmp/char.fbx", "bytes": 3 * 1048576, "selection_only": True,
+        "exported": ["Character", "Root", "Head_Geo"], "preset": "roblox",
+        "warnings": ["'Head_Geo' has 25,000 triangles; Roblox rejects meshes over 20,000."],
+    }})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: blender)
+    reply = asyncio.run(server.export_scene(None, filepath="/tmp/char.fbx", preset="roblox",
+                                            object_names=["Character"]))
+    assert blender.sent == [("export_scene", {
+        "filepath": "/tmp/char.fbx", "format": "glb", "object_names": ["Character"], "selection_only": False,
+        "apply_modifiers": True, "preset": "roblox"})]
+    assert "/tmp/char.fbx (3.0 MB)" in reply and "Head_Geo" in reply
+    assert "1 roblox warning(s)" in reply and "- 'Head_Geo' has 25,000 triangles" in reply
+
+
+def test_export_scene_without_a_preset_sends_what_older_addons_accept(monkeypatch):
+    blender = _Blender({"export_scene": {"path": "C:\\out\\a.glb", "bytes": 10, "selection_only": False,
+                                         "exported": ["A"]}})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: blender)
+    reply = asyncio.run(server.export_scene(None, filepath="C:\\out\\a.glb"))
+    assert "preset" not in blender.sent[0][1]
+    assert "Exported 1 object(s)" in reply and "warning" not in reply
+
+
+def test_export_scene_refuses_relative_paths_before_touching_blender(monkeypatch):
+    monkeypatch.setattr(server, "get_blender_connection", lambda: (_ for _ in ()).throw(AssertionError("sent")))
+    reply = asyncio.run(server.export_scene(None, filepath="exports/a.glb"))
+    assert reply.startswith("Error") and "//" in reply
+
+
+def test_export_scene_on_an_old_addon_asks_for_an_update(monkeypatch):
+    from blender_mcp.addon_manager import AddonHandshake
+
+    blender = _Blender({"export_scene": Exception(
+        "Communication error with Blender: export_scene() got an unexpected keyword argument 'preset'")})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: blender)
+    monkeypatch.setattr(server, "_addon_handshake", AddonHandshake(False, 13, [1, 8], [], "4.2", "native"))
+    reply = asyncio.run(server.export_scene(None, filepath="/tmp/a.fbx", preset="roblox"))
+    assert "too old for the roblox export preset" in reply and "install-addon" in reply
+    reply = asyncio.run(server.export_scene(None, filepath="//a.fbx"))
+    assert "too old" in reply and len(blender.sent) == 1, "// needs the new addon; not sent"
+
+
+def test_export_scene_passes_addon_errors_through(monkeypatch):
+    blender = _Blender({"export_scene": {"error": "Unknown preset 'unreal'. Valid presets: roblox"}})
+    monkeypatch.setattr(server, "get_blender_connection", lambda: blender)
+    reply = asyncio.run(server.export_scene(None, filepath="/tmp/a.fbx", preset="unreal"))
+    assert reply == "Error: Unknown preset 'unreal'. Valid presets: roblox"

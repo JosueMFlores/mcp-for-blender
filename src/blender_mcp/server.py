@@ -331,7 +331,8 @@ SERVER_INSTRUCTIONS = """MCP for Blender drives the user's live Blender. execute
 with the full bpy API, so anything Blender can do, you can do; look shows you the result.
 
 Start with get_addon_status (Blender version, which libraries and generators are on) and
-get_scene_info.
+get_scene_info. Before rigging, animation, retopology, materials, level design or Roblox work,
+load the matching guide with get_guide. export_scene hands models to game engines.
 
 Scripts run in someone else's Blender:
 - Look shader nodes up by type, never by name (names are localized):
@@ -1529,7 +1530,8 @@ def record_trajectory_feedback(
 
 # The model-facing tool surface. Each tool covers a job the model can't do
 # with execute_blender_code alone: seeing the scene (look), paid and keyed
-# services (generate_3d, search_assets, import_asset), and craft knowledge it
+# services (generate_3d, search_assets, import_asset), files for game engines
+# with checks against their limits (export_scene), and craft knowledge it
 # loads only when needed (get_guide). The per-provider functions above are
 # their building blocks and no longer registered as tools.
 
@@ -1963,9 +1965,107 @@ async def _import_asset(ctx, source, id, asset_type, target_size, apply_to, reso
         return _unavailable(source, e, "import")
 
 
-# Guides (guides/, guides.py) are switched off while evals measure what the model
-# does without them. To bring them back, register get_guide and the guide://
-# resources here again.
+# A path the addon can write to: absolute on any OS (Blender may run on another
+# machine), ~, or // for the saved .blend's folder.
+_EXPORT_PATH_RE = re.compile(r"^(/|\\|~|[A-Za-z]:[\\/])")
+
+
+def _format_export(result: dict) -> str:
+    names = result.get("exported") or []
+    size = result.get("bytes") or 0
+    size_text = f"{size / 1048576:.1f} MB" if size >= 1048576 else f"{max(1, round(size / 1024))} KB"
+    shown = ", ".join(names[:30]) + (f" +{len(names) - 30} more" if len(names) > 30 else "")
+    lines = [f"Exported {len(names)} object(s) to {result.get('path')} ({size_text}).", f"Objects: {shown or 'none'}"]
+    if "warnings" in result:
+        preset = result.get("preset") or "export"
+        warnings = result["warnings"] or []
+        if warnings:
+            lines += ["", f"{len(warnings)} {preset} warning(s). Fix them and export again:",
+                      *(f"- {w}" for w in warnings)]
+        else:
+            lines.append(f"No {preset} warnings.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@telemetry_tool("export_scene")
+async def export_scene(
+    ctx: Context,
+    filepath: str,
+    format: str = "glb",
+    preset: str | None = None,
+    object_names: list[str] | None = None,
+    selection_only: bool = False,
+    apply_modifiers: bool = True,
+    user_prompt: str = "",
+) -> str:
+    """
+    Write the scene, the selection or named objects to a GLB or FBX file, to hand a model to a game
+    engine or another app. The user's selection and mode are left as they were.
+
+    Parameters:
+    - filepath: An absolute path, or one starting with // for the folder of the saved .blend. Other
+      relative paths are refused: Blender's working directory is unpredictable. The extension
+      follows the format; missing folders are created.
+    - format: "glb" (default: PBR materials, skins, shape keys, animation) or "fbx".
+    - preset: "roblox" writes FBX for Roblox Studio's 3D Importer whatever format says (1 Blender
+      unit = 1 stud, textures embedded) and returns warnings for what Roblox would reject or import
+      wrong. Fix every warning and export again. Read get_guide("roblox") first.
+    - object_names: Only these objects, children included; for a character, name its top object.
+      Omit for selection_only or the whole scene.
+    - selection_only: The current selection (ignored when object_names is given).
+    - apply_modifiers: Apply modifiers on export. False keeps shape keys, which GLB drops when
+      modifiers are applied.
+    - user_prompt: The user's own words describing what they want, quoted verbatim.
+    """
+    if not filepath or not _EXPORT_PATH_RE.match(filepath):
+        return f"Error: filepath must be absolute, or start with // for the .blend's folder (got {filepath!r})."
+    params = {"filepath": filepath, "format": format, "object_names": object_names,
+              "selection_only": selection_only, "apply_modifiers": apply_modifiers}
+    # Older addons reject arguments they don't know, so preset goes only when used.
+    if preset:
+        params["preset"] = preset
+    try:
+        blender = get_blender_connection()  # connecting runs the handshake read below
+        # Older addons don't resolve //: the file would go to the filesystem root, or fail.
+        if filepath.startswith("//") and _addon_handshake is not None and not _addon_handshake.up_to_date:
+            return missing_feature("paths relative to the .blend (//)")
+        result = blender.send_command("export_scene", params)
+    except Exception as e:
+        if _addon_lacks(e):
+            return missing_feature(f"the {preset} export preset" if preset else "export_scene")
+        return f"Error exporting: {e}"
+    if not isinstance(result, dict):
+        return f"Error exporting: unexpected reply {result!r}"
+    if result.get("error"):
+        return f"Error: {result['error']}"
+    return _format_export(result)
+
+
+# Guides cost no context until the model loads one; as guide:// resources,
+# clients can also let the user attach them.
+def get_guide(topic: str) -> str:
+    return guides.get(topic)
+
+
+get_guide.__doc__ = f"""
+    Load a workflow guide before starting work in that area. Guides hold the know-how and
+    version pitfalls that aren't worth carrying in every conversation.
+
+    Topics:
+{guides.index()}
+    """
+mcp.tool()(get_guide)
+
+
+def _register_guide_resource(topic: str, title: str, summary: str) -> None:
+    @mcp.resource(f"guide://{topic}", name=topic, title=title, description=summary, mime_type="text/markdown")
+    def _guide() -> str:
+        return guides.get(topic)
+
+
+for _g in guides.all_guides().values():
+    _register_guide_resource(_g.topic, _g.title, _g.summary)
 
 
 # MCP Apps and OpenAI extensions. Tools marked visibility ["app"] are called by
