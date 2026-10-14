@@ -1478,8 +1478,16 @@ class BlenderMCPServer:
         except Exception:
             pass
 
-        # Close socket
+        # Close socket. close() alone doesn't wake the server thread's accept()
+        # on Linux, and the kernel keeps the port listening until that 1 s
+        # timeout runs out, so an immediate restart failed with "Address
+        # already in use". shutdown() wakes it (macOS refuses it on a
+        # listening socket; the join below outlasts the timeout there).
         if self.socket:
+            try:
+                self.socket.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
             try:
                 self.socket.close()
             except:
@@ -1510,11 +1518,12 @@ class BlenderMCPServer:
             except queue.Empty:
                 break
 
-        # Wait for thread to finish
+        # Wait for thread to finish; longer than accept()'s 1 s timeout, so the
+        # port is free by the time stop() returns.
         if self.server_thread:
             try:
                 if self.server_thread.is_alive():
-                    self.server_thread.join(timeout=1.0)
+                    self.server_thread.join(timeout=2.0)
             except:
                 pass
             self.server_thread = None
@@ -1544,6 +1553,8 @@ class BlenderMCPServer:
                     # Just check running condition
                     continue
                 except Exception as e:
+                    if not self.running:
+                        break  # stop() closed the socket under accept()
                     print(f"Error accepting connection: {str(e)}")
                     time.sleep(0.5)
             except Exception as e:

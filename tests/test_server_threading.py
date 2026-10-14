@@ -212,6 +212,28 @@ def bpy_timer_registered(server):
     return server._drain_command_queue in _registered
 
 
+def test_stop_releases_the_port_before_returning():
+    """stop() must not return while the old listening socket still holds the port."""
+    port = _free_port()
+    server = BlenderMCPServer(port=port)
+    server.start()
+    thread = server.server_thread
+    time.sleep(0.1)  # let the server thread park in accept()
+
+    started = time.time()
+    server.stop()
+    elapsed = time.time() - started
+
+    assert not thread.is_alive(), "server thread outlived stop()"
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind(("localhost", port))
+        probe.listen(1)
+    if sys.platform.startswith("linux"):
+        # shutdown() wakes accept() at once there instead of after its timeout.
+        assert elapsed < 0.5, f"stop() took {elapsed:.2f}s"
+
+
 def test_restart_rebinds_port_cleanly():
     """A stopped server must fully release the port for the next start()."""
     port = _free_port()
